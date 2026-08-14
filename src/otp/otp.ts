@@ -1,0 +1,81 @@
+import crypto from 'node:crypto';
+import { db } from '../db.ts';
+import { config, type ProjectConfig } from '../config.ts';
+import { toSqliteUtc } from '../utils.ts';
+
+function hashCode(phone: string, code: string): string {
+  return crypto.createHmac('sha256', config.otpHashSecret).update(`${phone}:${code}`).digest('hex');
+}
+
+function generateSixDigitCode(): string {
+  return crypto.randomInt(0, 1_000_000).toString().padStart(6, '0');
+}
+
+const selectLatest = db.prepare(`
+  SELECT id, code_hash, attempts, max_attempts, expires_at, verified_at, created_at
+  FROM otp_codes WHERE project = ? AND phone = ? AND purpose = ? ORDER BY created_at DESC LIMIT 1
+`);
+
+const insertOtp = db.prepare(`
+  INSERT INTO otp_codes (project, phone, code_hash, max_attempts, expires_at, purpose)
+  VALUES (?, ?, ?, ?, ?, ?)
+`);
+
+const bumpAttempts = db.prepare(`UPDATE otp_codes SET attempts = attempts + 1 WHERE id = ?`);
+const markVerified = db.prepare(`UPDATE otp_codes SET verified_at = datetime('now') WHERE id = ?`);
+
+export type GenerateResult =
+  | { ok: true; code: string }
+  | { ok: false; reason: 'cooldown'; retryAfterSeconds: number };
+
+export function generateOtp(project: ProjectConfig, phone: string, purpose = 'login'): GenerateResult {
+  const latest = selectLatest.get(project.id, phone, purpose) as
+    | { created_at: string }
+    | undefined;
+
+  if (latest) {
+    const elapsedMs = Date.now() - new Date(`${latest.created_at}Z`).getTime();
+    const cooldownMs = project.resendCooldownMinutes * 60_000;
+    if (elapsedMs < cooldownMs) {
+      return { ok: false, reason: 'cooldown', retryAfterSeconds: Math.ceil((cooldownMs - elapsedMs) / 1000) };
+    }
+  }
+
+  const code = generateSixDigitCode();
+  const expiresAt = toSqliteUtc(Date.now() + project.otpExpiryMinutes * 60_000);
+  insertOtp.run(project.id, phone, hashCode(phone, code), project.otpMaxAttempts, expiresAt, purpose);
+  return { ok: true, code };
+}
+
+export type VerifyResult =
+  | { ok: true }
+  | { ok: false; reason: 'not_found_or_expired' | 'too_many_attempts' | 'invalid_code'; attemptsRemaining?: number };
+
+export function verifyOtp(project: ProjectConfig, phone: string, submittedCode: string, purpose = 'login'): VerifyResult {
+  const latest = selectLatest.get(project.id, phone, purpose) as
+    | {
+        id: number;
+        code_hash: string;
+        attempts: number;
+        max_attempts: number;
+        expires_at: string;
+        verified_at: string | null;
+      }
+    | undefined;
+
+  if (!latest || latest.verified_at) return { ok: false, reason: 'not_found_or_expired' };
+  if (new Date(`${latest.expires_at}Z`).getTime() < Date.now()) return { ok: false, reason: 'not_found_or_expired' };
+  if (latest.attempts >= latest.max_attempts) return { ok: false, reason: 'too_many_attempts' };
+
+  const submittedHash = Buffer.from(hashCode(phone, submittedCode));
+  const storedHash = Buffer.from(latest.code_hash);
+  const matches = submittedHash.length === storedHash.length && crypto.timingSafeEqual(submittedHash, storedHash);
+
+  if (matches) {
+    markVerified.run(latest.id);
+    return { ok: true };
+  }
+
+  bumpAttempts.run(latest.id);
+  return { ok: false, reason: 'invalid_code', attemptsRemaining: latest.max_attempts - latest.attempts - 1 };
+}

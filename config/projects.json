@@ -1,0 +1,9 @@
+[
+  {
+    "id": "store",
+    "brandName": "Talisham",
+    "resendCooldownMinutes": 10,
+    "otpExpiryMinutes": 5,
+    "otpMaxAttempts": 5
+  }
+]
