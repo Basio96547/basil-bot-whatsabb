@@ -43,7 +43,9 @@ pm2 status
 
 echo "=== 4) الفحص المحلي ==="
 key=$(grep '^PROJECT_API_KEY_STORE=' .env | cut -d= -f2-)
-curl -s -m 10 -H "Authorization: Bearer $key" http://localhost:3000/health
+# `|| true` لأن `set -e` أعلاه كان سيوقف السكربت قبل طباعة النتيجة لو ردّ
+# curl بخطأ — وهي بالضبط الحالة التي نحتاج أن نراها فيها.
+curl -s -m 10 -H "Authorization: Bearer $key" http://localhost:3000/health || echo "(الخدمة لم تردّ بعد)"
 echo ""
 echo "=== تم ==="
 echo "تحقّق من الخارج أيضاً: https://sms-api.talisham.com/health"

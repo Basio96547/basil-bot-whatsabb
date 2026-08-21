@@ -7,7 +7,7 @@ import makeWASocket, {
 import qrcodeTerminal from 'qrcode-terminal';
 import pino from 'pino';
 import { config } from '../config.ts';
-import { scheduleSessionBackup, restoreSessionFromR2 } from './sessionBackup.ts';
+import { scheduleSessionBackup, restoreSessionFromR2, restoreFromLocal } from './sessionBackup.ts';
 import { probeCreds, useAtomicMultiFileAuthState } from './authState.ts';
 
 const logger = pino({ level: 'silent' }); // Baileys' own internal logger — noisy at 'info', we log our own lines below
@@ -94,7 +94,17 @@ async function prepareSession(): Promise<void> {
   if (probe === 'ok') return;
 
   const problem = probe === 'corrupt' ? 'ملف الجلسة تالف' : 'لا توجد جلسة محلية';
-  app.info(`[whatsapp] ${problem} — محاولة الاستعادة من R2`);
+  app.info(`[whatsapp] ${problem} — محاولة الاستعادة`);
+
+  // Local copy first: it needs no credentials, is never staler than the R2
+  // one, and can't fail on a dead tunnel.
+  const local = restoreFromLocal();
+  if (local.ok) {
+    state.sessionOrigin = 'restored';
+    state.sessionNote = `${problem} — استُعيدت ${local.files} ملف من النسخة المحلية`;
+    app.info(`[whatsapp] ${state.sessionNote}`);
+    return;
+  }
 
   const restore = await restoreSessionFromR2();
   if (restore.ok) {
@@ -106,8 +116,8 @@ async function prepareSession(): Promise<void> {
 
   state.sessionNote =
     restore.reason === 'not_configured'
-      ? `${problem}، ونسخ R2 غير مُفعَّل`
-      : `${problem}، وتعذّرت الاستعادة من R2 (${restore.reason})`;
+      ? `${problem}، ولا نسخة محلية، ونسخ R2 غير مُفعَّل`
+      : `${problem}، ولا نسخة محلية، وتعذّرت الاستعادة من R2 (${restore.reason})`;
   app.error(`[whatsapp] ${state.sessionNote}`, restore.error);
 }
 
@@ -153,9 +163,13 @@ export async function connectWhatsApp(): Promise<void> {
     }
   }
 
+  // Only a live, paired session is worth copying over the backup — see
+  // scheduleSessionBackup's own comment for what this guard prevents.
+  const backupEligible = () => state.connected && !state.needsReauth;
+
   socket.ev.on('creds.update', () => {
     void saveCreds();
-    scheduleSessionBackup(app);
+    scheduleSessionBackup(app, backupEligible);
   });
 
   socket.ev.on('connection.update', (update) => {
@@ -179,6 +193,10 @@ export async function connectWhatsApp(): Promise<void> {
       state.sessionNote = null;
       reconnectAttempt = 0;
       app.info('[whatsapp] متصل');
+      // First snapshot of a newly-paired or newly-restored session. Without
+      // this, a session paired and then lost before any creds.update would
+      // have no backup at all.
+      scheduleSessionBackup(app, backupEligible);
     }
 
     if (connection === 'close') {

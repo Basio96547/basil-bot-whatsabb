@@ -1,15 +1,27 @@
 import crypto from 'node:crypto';
-import { readdirSync, readFileSync, mkdirSync, writeFileSync } from 'node:fs';
+import { readdirSync, readFileSync, mkdirSync, writeFileSync, renameSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import { S3Client, PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
 import { config } from '../config.ts';
 
-// Plan 8, layer 6: encrypted backup of the Baileys auth-state folder to R2,
-// uploaded on creds.update (not a fixed schedule) so a lost/corrupted phone
-// never means re-scanning QR from zero. Debounced — creds.update fires often
-// during normal operation and we don't need to re-upload every single time.
+// Plan 8, layer 6: backup of the Baileys auth-state folder, taken on
+// creds.update (not a fixed schedule) so a lost or corrupted session never
+// means re-scanning QR from zero. Debounced — creds.update fires often during
+// normal operation and re-copying on every single one is pointless.
+//
+// TWO layers, because they fail for different reasons:
+//
+//   1. A plain local copy in `<dataDir>/auth-session-backup`. Needs no
+//      credentials at all, so it is always on. Covers the realistic failures:
+//      a torn creds.json, an accidental delete, a bad overwrite.
+//   2. The encrypted copy on R2, when R2 is configured. This is the one that
+//      survives losing the phone itself — the local copy obviously cannot.
+//
+// Restore prefers the local copy: it is newer by definition (written on the
+// same event, without a network round-trip) and cannot fail on a dead tunnel.
 
 const AUTH_DIR = path.join(config.dataDir, 'auth-session');
+const LOCAL_BACKUP_DIR = `${AUTH_DIR}-backup`;
 const BACKUP_KEY = 'whatsapp-session.enc';
 const DEBOUNCE_MS = 30_000;
 
@@ -70,6 +82,50 @@ async function runBackup(): Promise<void> {
   );
 }
 
+// ---- layer 1: local copy (no credentials, always on) ----
+
+function writeFileAtomic(filePath: string, contents: string): void {
+  const tmpPath = `${filePath}.tmp`;
+  writeFileSync(tmpPath, contents, 'utf-8');
+  renameSync(tmpPath, filePath);
+}
+
+export function snapshotLocal(): number {
+  // Cleared first so keys deleted from the live folder don't linger here and
+  // get restored later as stale signal state.
+  rmSync(LOCAL_BACKUP_DIR, { recursive: true, force: true });
+  mkdirSync(LOCAL_BACKUP_DIR, { recursive: true });
+
+  const files = readdirSync(AUTH_DIR).filter((name) => name.endsWith('.json'));
+  for (const name of files) {
+    writeFileAtomic(path.join(LOCAL_BACKUP_DIR, name), readFileSync(path.join(AUTH_DIR, name), 'utf-8'));
+  }
+  return files.length;
+}
+
+export function restoreFromLocal(): { ok: true; files: number } | { ok: false; reason: 'no_backup' | 'error'; error?: unknown } {
+  try {
+    // Verified before anything is overwritten — restoring an unreadable backup
+    // over a merely-damaged session turns a recoverable state into a broken one.
+    JSON.parse(readFileSync(path.join(LOCAL_BACKUP_DIR, 'creds.json'), 'utf-8'));
+  } catch {
+    return { ok: false, reason: 'no_backup' };
+  }
+
+  try {
+    mkdirSync(AUTH_DIR, { recursive: true });
+    const files = readdirSync(LOCAL_BACKUP_DIR).filter((name) => name.endsWith('.json'));
+    for (const name of files) {
+      writeFileAtomic(path.join(AUTH_DIR, name), readFileSync(path.join(LOCAL_BACKUP_DIR, name), 'utf-8'));
+    }
+    return { ok: true, files: files.length };
+  } catch (error) {
+    return { ok: false, reason: 'error', error };
+  }
+}
+
+// ---- layer 2: encrypted copy on R2 (survives losing the phone) ----
+
 export type RestoreResult =
   | { ok: true; files: number }
   | { ok: false; reason: 'not_configured' | 'no_backup' | 'error'; error?: unknown };
@@ -109,10 +165,30 @@ export async function restoreSessionFromR2(): Promise<RestoreResult> {
 
 let debounceTimer: ReturnType<typeof setTimeout> | null = null;
 
-export function scheduleSessionBackup(logger: { info: (msg: string) => void; error: (msg: string, err: unknown) => void }): void {
-  if (!config.sessionBackup.enabled) return;
+/**
+ * `isEligible` is the rule that makes this safe to run automatically: a
+ * snapshot is only ever taken from a REGISTERED, currently-connected session.
+ * Without it, the first QR-pending boot after a wipe would overwrite the good
+ * backup with a blank identity — turning the safety net into the thing that
+ * destroys the session.
+ */
+export function scheduleSessionBackup(
+  logger: { info: (msg: string) => void; error: (msg: string, err: unknown) => void },
+  isEligible: () => boolean,
+): void {
   if (debounceTimer) clearTimeout(debounceTimer);
   debounceTimer = setTimeout(() => {
+    debounceTimer = null;
+    if (!isEligible()) return;
+
+    try {
+      const files = snapshotLocal();
+      logger.info(`[session-backup] نسخة محلية: ${files} ملف`);
+    } catch (err) {
+      logger.error('[session-backup] فشلت النسخة المحلية', err);
+    }
+
+    if (!config.sessionBackup.enabled) return;
     runBackup().then(
       () => logger.info('[session-backup] uploaded encrypted session to R2'),
       (err) => logger.error('[session-backup] upload failed, will retry on next change', err),
