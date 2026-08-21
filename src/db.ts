@@ -63,3 +63,10 @@ db.exec(`
 // Migration: add purpose column so login and password-reset OTPs have separate
 // cooldowns and cannot be cross-verified. Existing rows get 'login' by default.
 try { db.exec(`ALTER TABLE otp_codes ADD COLUMN purpose TEXT NOT NULL DEFAULT 'login'`); } catch { /* already exists */ }
+
+// Migration: a queued message is only worth sending for so long. After a long
+// outage the queue drains in creation order, and without this an OTP that sat
+// there for an hour still went out — arriving as a code that expired 50
+// minutes ago. NULL means "no deadline" (rows queued before this column
+// existed, and any future event where late is still better than never).
+try { db.exec(`ALTER TABLE messages ADD COLUMN expires_at TEXT`); } catch { /* already exists */ }

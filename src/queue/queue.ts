@@ -1,6 +1,13 @@
 import { db } from '../db.ts';
 import { config } from '../config.ts';
+import { toSqliteUtc } from '../utils.ts';
 import type { Channel } from '../whatsapp/existence.ts';
+
+// A notification that shows up a day late is noise, not service — but unlike
+// an OTP it isn't actively misleading, so it gets a generous ceiling rather
+// than a tight one. Callers with a real deadline (OTP, password reset) pass
+// their own ttlMinutes.
+const DEFAULT_TTL_MINUTES = 24 * 60;
 
 export interface EnqueueInput {
   project: string;
@@ -8,14 +15,15 @@ export interface EnqueueInput {
   recipient: string; // digits-only, international format
   payload: Record<string, string | number>;
   channel?: Channel; // explicit override — skips auto-routing (plan 4.1, 4.6)
+  ttlMinutes?: number; // how long this message is still worth delivering
 }
 
 export type EnqueueResult = { ok: true; id: number } | { ok: false; reason: 'queue_full' };
 
 const countPendingStmt = db.prepare(`SELECT COUNT(*) AS n FROM messages WHERE status = 'pending'`);
 const insertStmt = db.prepare(`
-  INSERT INTO messages (project, channel, channel_forced, event, recipient, payload)
-  VALUES (?, ?, ?, ?, ?, ?)
+  INSERT INTO messages (project, channel, channel_forced, event, recipient, payload, expires_at)
+  VALUES (?, ?, ?, ?, ?, ?, ?)
 `);
 
 // Plan 9, point 2: backpressure — refuse new work past a sane cap instead of
@@ -24,6 +32,7 @@ export function enqueue(input: EnqueueInput): EnqueueResult {
   const pending = (countPendingStmt.get() as { n: number }).n;
   if (pending >= config.queue.maxPending) return { ok: false, reason: 'queue_full' };
 
+  const ttlMinutes = input.ttlMinutes ?? DEFAULT_TTL_MINUTES;
   const result = insertStmt.run(
     input.project,
     input.channel ?? null,
@@ -31,6 +40,7 @@ export function enqueue(input: EnqueueInput): EnqueueResult {
     input.event,
     input.recipient,
     JSON.stringify(input.payload),
+    toSqliteUtc(Date.now() + ttlMinutes * 60_000),
   );
   return { ok: true, id: Number(result.lastInsertRowid) };
 }
@@ -47,6 +57,7 @@ export interface MessageRow {
   status: 'pending' | 'sent' | 'failed';
   attempts: number;
   last_error: string | null;
+  expires_at: string | null;
 }
 
 const pendingBatchStmt = db.prepare(`

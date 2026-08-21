@@ -2,6 +2,7 @@ import 'dotenv/config';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+import { validateVariants, type TemplateOverrides } from './templates/templates.ts';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '..');
@@ -13,6 +14,7 @@ export interface ProjectConfig {
   resendCooldownMinutes: number;
   otpExpiryMinutes: number;
   otpMaxAttempts: number;
+  templates?: TemplateOverrides;
 }
 
 interface ProjectFileEntry {
@@ -21,6 +23,7 @@ interface ProjectFileEntry {
   resendCooldownMinutes: number;
   otpExpiryMinutes: number;
   otpMaxAttempts: number;
+  templates?: TemplateOverrides;
 }
 
 function requireEnv(name: string): string {
@@ -29,11 +32,25 @@ function requireEnv(name: string): string {
   return value;
 }
 
+// Same fail-fast contract as requireEnv: a malformed template block stops the
+// service at boot instead of surfacing as a broken message weeks later.
+function requireValidTemplates(projectId: string, templates: TemplateOverrides | undefined): void {
+  if (templates === undefined) return;
+  if (typeof templates !== 'object' || Array.isArray(templates)) {
+    throw new Error(`Project "${projectId}": "templates" must be an object mapping event -> array of variants`);
+  }
+  for (const [event, variants] of Object.entries(templates)) {
+    const problem = validateVariants(event, variants);
+    if (problem) throw new Error(`Project "${projectId}" templates: ${problem}`);
+  }
+}
+
 function loadProjects(): ProjectConfig[] {
   const raw = readFileSync(path.join(repoRoot, 'config', 'projects.json'), 'utf-8');
   const entries = JSON.parse(raw) as ProjectFileEntry[];
   return entries.map((entry) => {
     const envKey = `PROJECT_API_KEY_${entry.id.toUpperCase()}`;
+    requireValidTemplates(entry.id, entry.templates);
     return { ...entry, apiKey: requireEnv(envKey) };
   });
 }

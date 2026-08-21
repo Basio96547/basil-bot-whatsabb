@@ -57,7 +57,15 @@ router.post('/otp/request', (req, res) => {
     return;
   }
 
-  const enqueued = enqueue({ project: project.id, event: 'otp', recipient: to, payload: { code: generated.code } });
+  // Past its own validity window the code is worse than no message at all —
+  // the recipient types in a number the server already rejects.
+  const enqueued = enqueue({
+    project: project.id,
+    event: 'otp',
+    recipient: to,
+    payload: { code: generated.code },
+    ttlMinutes: project.otpExpiryMinutes,
+  });
   if (!enqueued.ok) {
     res.status(429).json({ error: enqueued.reason });
     return;
@@ -97,7 +105,13 @@ router.post('/password-reset/request', (req, res) => {
     return;
   }
 
-  const enqueued = enqueue({ project: project.id, event: 'password_reset', recipient: to, payload: { code: generated.code } });
+  const enqueued = enqueue({
+    project: project.id,
+    event: 'password_reset',
+    recipient: to,
+    payload: { code: generated.code },
+    ttlMinutes: project.otpExpiryMinutes,
+  });
   if (!enqueued.ok) {
     res.status(429).json({ error: enqueued.reason });
     return;
@@ -162,10 +176,21 @@ router.get('/status/:id', (req, res) => {
 router.get('/health', (_req, res) => {
   const pending = countPending();
   const wa = getConnectionState();
-  const degraded = pending > config.queue.maxPending * 0.8 || wa.needsReauth || !wa.connected;
+
+  // Named reasons rather than a bare boolean: the monitor polling this turns
+  // them straight into the alert text, so "needs a QR scan" and "the phone
+  // dropped off the network" don't arrive as the same useless "degraded".
+  const reasons: string[] = [];
+  if (wa.needsReauth) reasons.push('whatsapp_needs_reauth');
+  else if (!wa.connected) reasons.push('whatsapp_disconnected');
+  if (wa.sessionOrigin === 'restored') reasons.push('session_restored_from_backup');
+  if (pending > config.queue.maxPending * 0.8) reasons.push('queue_near_capacity');
+
+  const degraded = reasons.length > 0 && !(reasons.length === 1 && reasons[0] === 'session_restored_from_backup');
 
   res.status(degraded ? 503 : 200).json({
     status: degraded ? 'degraded' : 'ok',
+    reasons,
     whatsapp: wa,
     queue: { pending, maxPending: config.queue.maxPending },
   });

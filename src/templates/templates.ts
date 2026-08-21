@@ -38,6 +38,10 @@ const VARIANTS: Record<string, string[]> = {
 
 export type TemplateEvent = keyof typeof VARIANTS;
 
+// Per-project overrides from config/projects.json — a project supplies its own
+// phrasings for some events and silently keeps the defaults above for the rest.
+export type TemplateOverrides = Record<string, string[]>;
+
 // These events are triggered only by dedicated endpoints (/otp/request,
 // /password-reset/request) — never by the generic /notify route.
 const INTERNAL_EVENTS = new Set(['otp', 'password_reset']);
@@ -46,11 +50,46 @@ export function knownEvents(): string[] {
   return Object.keys(VARIANTS).filter(e => !INTERNAL_EVENTS.has(e));
 }
 
+const PLACEHOLDER_RE = /\{(\w+)\}/g;
+
+function placeholdersIn(text: string): string[] {
+  return Array.from(text.matchAll(PLACEHOLDER_RE), (m) => m[1]);
+}
+
+// Always injected by the worker for every event, so an override may use them
+// even when no default variant of that event happens to.
+const AMBIENT_PLACEHOLDERS = ['brand', 'expiryMinutes'];
+
+// Checked once at boot (config.ts) rather than at send time — a typo'd
+// placeholder would otherwise ship silently and reach a customer as the
+// literal text "{cod}" inside their verification message.
+export function validateVariants(event: string, variants: unknown): string | null {
+  const defaults = VARIANTS[event];
+  if (!defaults) return `unknown event "${event}" (known: ${Object.keys(VARIANTS).join(', ')})`;
+  if (!Array.isArray(variants) || variants.length === 0) return `"${event}" must be a non-empty array of strings`;
+
+  const allowed = new Set([...AMBIENT_PLACEHOLDERS, ...defaults.flatMap(placeholdersIn)]);
+
+  for (const variant of variants) {
+    if (typeof variant !== 'string' || variant.trim() === '') return `"${event}" contains an empty or non-string variant`;
+
+    const used = placeholdersIn(variant);
+    const unknown = used.find((p) => !allowed.has(p));
+    if (unknown) return `"${event}" uses unknown placeholder {${unknown}} (allowed: ${[...allowed].join(', ')})`;
+
+    // The code IS the message for these two — a variant missing it would send
+    // a perfectly well-formed but useless verification message.
+    if (INTERNAL_EVENTS.has(event) && !used.includes('code')) return `"${event}" variant is missing the {code} placeholder`;
+  }
+  return null;
+}
+
 export function renderTemplate(
   event: string,
   data: Record<string, string | number>,
+  overrides?: TemplateOverrides,
 ): { text: string; variantIndex: number } {
-  const variants = VARIANTS[event];
+  const variants = overrides?.[event] ?? VARIANTS[event];
   if (!variants) throw new Error(`Unknown template event: ${event}`);
 
   const variantIndex = crypto.randomInt(0, variants.length);

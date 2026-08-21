@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
-import { readdirSync, readFileSync } from 'node:fs';
+import { readdirSync, readFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
+import { S3Client, PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
 import { config } from '../config.ts';
 
 // Plan 8, layer 6: encrypted backup of the Baileys auth-state folder to R2,
@@ -68,6 +68,43 @@ async function runBackup(): Promise<void> {
   await getS3().send(
     new PutObjectCommand({ Bucket: config.sessionBackup.r2Bucket, Key: BACKUP_KEY, Body: encrypted }),
   );
+}
+
+export type RestoreResult =
+  | { ok: true; files: number }
+  | { ok: false; reason: 'not_configured' | 'no_backup' | 'error'; error?: unknown };
+
+// Pulls the last encrypted bundle back down and rewrites the auth folder.
+// Shared by the boot-time auto-restore in client.ts and the manual runbook
+// script — a divergence between "what the runbook does" and "what the service
+// does on its own" is exactly the kind of thing that bites during an outage.
+export async function restoreSessionFromR2(): Promise<RestoreResult> {
+  if (!config.sessionBackup.enabled) return { ok: false, reason: 'not_configured' };
+
+  try {
+    const response = await getS3().send(
+      new GetObjectCommand({ Bucket: config.sessionBackup.r2Bucket, Key: BACKUP_KEY }),
+    );
+    if (!response.Body) return { ok: false, reason: 'no_backup' };
+
+    const chunks: Buffer[] = [];
+    for await (const chunk of response.Body as AsyncIterable<Buffer>) chunks.push(chunk);
+
+    // Decrypting before touching the auth folder — a wrong
+    // SESSION_BACKUP_ENCRYPTION_KEY or a truncated object must fail here,
+    // with the existing (possibly still usable) files left untouched.
+    const bundle = JSON.parse(decryptBundle(Buffer.concat(chunks))) as Record<string, string>;
+
+    mkdirSync(AUTH_DIR, { recursive: true });
+    for (const [filename, contents] of Object.entries(bundle)) {
+      writeFileSync(path.join(AUTH_DIR, filename), contents, 'utf-8');
+    }
+    return { ok: true, files: Object.keys(bundle).length };
+  } catch (error) {
+    const code = (error as { name?: string })?.name;
+    if (code === 'NoSuchKey' || code === 'NotFound') return { ok: false, reason: 'no_backup' };
+    return { ok: false, reason: 'error', error };
+  }
 }
 
 let debounceTimer: ReturnType<typeof setTimeout> | null = null;
