@@ -48,6 +48,20 @@ db.exec(`
     checked_at    TEXT NOT NULL DEFAULT (datetime('now'))
   );
 
+  -- Counts OTP sends per number for the daily cap. Separate from otp_codes
+  -- because that table is purged an hour after a code is spent or expires
+  -- (retention.ts) — counting rows there would reset the cap almost
+  -- immediately. Deliberately holds NO code and NO hash: just who was
+  -- messaged and when, which the messages table already keeps for longer.
+  CREATE TABLE IF NOT EXISTS otp_send_log (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    project    TEXT NOT NULL,
+    phone      TEXT NOT NULL,
+    purpose    TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_otp_send_log_lookup ON otp_send_log(project, phone, purpose, created_at);
+
   CREATE TABLE IF NOT EXISTS reset_tokens (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     project    TEXT NOT NULL,

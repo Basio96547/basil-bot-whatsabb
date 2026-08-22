@@ -14,6 +14,8 @@ export interface ProjectConfig {
   resendCooldownMinutes: number;
   otpExpiryMinutes: number;
   otpMaxAttempts: number;
+  /** Hard ceiling on verification messages to one number per rolling 24h. */
+  otpMaxPerDay: number;
   templates?: TemplateOverrides;
 }
 
@@ -23,8 +25,14 @@ interface ProjectFileEntry {
   resendCooldownMinutes: number;
   otpExpiryMinutes: number;
   otpMaxAttempts: number;
+  otpMaxPerDay?: number;
   templates?: TemplateOverrides;
 }
+
+// Enough for a genuine user who mistypes their number, gets a code late, and
+// retries — and far below the volume that reads as abuse to WhatsApp or to
+// whoever owns the number being messaged.
+const DEFAULT_OTP_MAX_PER_DAY = 5;
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -51,7 +59,13 @@ function loadProjects(): ProjectConfig[] {
   return entries.map((entry) => {
     const envKey = `PROJECT_API_KEY_${entry.id.toUpperCase()}`;
     requireValidTemplates(entry.id, entry.templates);
-    return { ...entry, apiKey: requireEnv(envKey) };
+    return {
+      ...entry,
+      // `??` rather than a spread default: an explicit null in the JSON would
+      // otherwise slip through as null and disable the cap entirely.
+      otpMaxPerDay: entry.otpMaxPerDay ?? DEFAULT_OTP_MAX_PER_DAY,
+      apiKey: requireEnv(envKey),
+    };
   });
 }
 

@@ -24,11 +24,34 @@ const insertOtp = db.prepare(`
 const bumpAttempts = db.prepare(`UPDATE otp_codes SET attempts = attempts + 1 WHERE id = ?`);
 const markVerified = db.prepare(`UPDATE otp_codes SET verified_at = datetime('now') WHERE id = ?`);
 
+const insertSendLog = db.prepare(`INSERT INTO otp_send_log (project, phone, purpose) VALUES (?, ?, ?)`);
+
+// The cap is a rolling 24h window, not a calendar day — a calendar day resets
+// at midnight, so an abuser just waits for it and sends the next burst.
+const DAY_MS = 24 * 60 * 60 * 1000;
+const countRecentSends = db.prepare(`
+  SELECT COUNT(*) AS n, MIN(created_at) AS oldest
+  FROM otp_send_log
+  WHERE project = ? AND phone = ? AND purpose = ? AND created_at > datetime('now', '-24 hours')
+`);
+
 export type GenerateResult =
   | { ok: true; code: string }
-  | { ok: false; reason: 'cooldown'; retryAfterSeconds: number };
+  | { ok: false; reason: 'cooldown' | 'daily_limit'; retryAfterSeconds: number };
 
 export function generateOtp(project: ProjectConfig, phone: string, purpose = 'login'): GenerateResult {
+  // Checked before the cooldown: the cooldown only spaces requests out, so on
+  // its own it still permits a message every few minutes forever — 144 a day
+  // to one number at a 10-minute cooldown. That is harassment of whoever owns
+  // the number, and the kind of volume that gets the SENDING number banned.
+  const recent = countRecentSends.get(project.id, phone, purpose) as { n: number; oldest: string | null };
+  if (recent.n >= project.otpMaxPerDay) {
+    // Freed when the oldest send in the window ages out, not a flat delay.
+    const oldestMs = recent.oldest ? new Date(`${recent.oldest}Z`).getTime() : Date.now();
+    const retryAfterSeconds = Math.max(1, Math.ceil((oldestMs + DAY_MS - Date.now()) / 1000));
+    return { ok: false, reason: 'daily_limit', retryAfterSeconds };
+  }
+
   const latest = selectLatest.get(project.id, phone, purpose) as
     | { created_at: string }
     | undefined;
@@ -44,6 +67,7 @@ export function generateOtp(project: ProjectConfig, phone: string, purpose = 'lo
   const code = generateSixDigitCode();
   const expiresAt = toSqliteUtc(Date.now() + project.otpExpiryMinutes * 60_000);
   insertOtp.run(project.id, phone, hashCode(phone, code), project.otpMaxAttempts, expiresAt, purpose);
+  insertSendLog.run(project.id, phone, purpose);
   return { ok: true, code };
 }
 

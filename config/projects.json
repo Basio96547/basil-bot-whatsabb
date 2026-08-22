@@ -3,8 +3,9 @@
     "id": "store",
     "brandName": "Talisham",
     "resendCooldownMinutes": 10,
-    "otpExpiryMinutes": 5,
-    "otpMaxAttempts": 5
+    "otpExpiryMinutes": 10,
+    "otpMaxAttempts": 5,
+    "otpMaxPerDay": 5
   },
   {
     "id": "qareeb",
@@ -12,15 +13,16 @@
     "resendCooldownMinutes": 2,
     "otpExpiryMinutes": 10,
     "otpMaxAttempts": 5,
+    "otpMaxPerDay": 5,
     "templates": {
       "otp": [
-        "كود تفعيل رقمك في {brand}: {code}\nينتهي خلال {expiryMinutes} دقيقة. لا ترسله لأي شخص.",
-        "{code} — هذا كود تأكيد رقم هاتفك في {brand}. صالح {expiryMinutes} دقيقة فقط.",
-        "أهلاً بك في {brand} 👋\nكود التفعيل: {code}\nصالح {expiryMinutes} دقيقة."
+        "كود تفعيل رقمك في {brand}: {code}\nينتهي خلال {expiryMinutes} دقائق. لا ترسله لأي شخص.",
+        "{code} — هذا كود تأكيد رقم هاتفك في {brand}. صالح {expiryMinutes} دقائق فقط.",
+        "أهلاً بك في {brand} 👋\nكود التفعيل: {code}\nصالح {expiryMinutes} دقائق."
       ],
       "password_reset": [
-        "كود استعادة حسابك في {brand}: {code}\nصالح {expiryMinutes} دقيقة. إن لم تطلبه، تجاهل هذه الرسالة.",
-        "{code} — كود تغيير كلمة المرور في {brand}. صالح {expiryMinutes} دقيقة."
+        "كود استعادة حسابك في {brand}: {code}\nصالح {expiryMinutes} دقائق. إن لم تطلبه، تجاهل هذه الرسالة.",
+        "{code} — كود تغيير كلمة المرور في {brand}. صالح {expiryMinutes} دقائق."
       ]
     }
   }

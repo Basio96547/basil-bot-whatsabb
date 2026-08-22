@@ -20,23 +20,35 @@ const purgeSpentOtp = db.prepare(`
      OR (expires_at < datetime('now', '-${OTP_RETENTION_HOURS} hours'))
 `);
 
+// 48h, not 24: the cap reads a rolling 24-hour window, so purging at exactly
+// 24h would race the very rows it counts.
+const purgeOldSendLog = db.prepare(`
+  DELETE FROM otp_send_log WHERE created_at < datetime('now', '-48 hours')
+`);
+
 const purgeSpentResetTokens = db.prepare(`
   DELETE FROM reset_tokens
   WHERE (used_at IS NOT NULL AND used_at < datetime('now', '-${RESET_TOKEN_RETENTION_HOURS} hours'))
      OR (expires_at < datetime('now', '-${RESET_TOKEN_RETENTION_HOURS} hours'))
 `);
 
-export function runRetentionSweep(): { messagesDeleted: number; otpDeleted: number; resetTokensDeleted: number } {
+export function runRetentionSweep(): { messagesDeleted: number; otpDeleted: number; resetTokensDeleted: number; sendLogDeleted: number } {
   const messagesDeleted = purgeOldMessages.run().changes;
   const otpDeleted = purgeSpentOtp.run().changes;
   const resetTokensDeleted = purgeSpentResetTokens.run().changes;
-  return { messagesDeleted: Number(messagesDeleted), otpDeleted: Number(otpDeleted), resetTokensDeleted: Number(resetTokensDeleted) };
+  const sendLogDeleted = purgeOldSendLog.run().changes;
+  return {
+    messagesDeleted: Number(messagesDeleted),
+    otpDeleted: Number(otpDeleted),
+    resetTokensDeleted: Number(resetTokensDeleted),
+    sendLogDeleted: Number(sendLogDeleted),
+  };
 }
 
 export function scheduleDailyRetention(): void {
   const sweep = () => {
     const result = runRetentionSweep();
-    console.log(`[retention] deleted ${result.messagesDeleted} old message(s), ${result.otpDeleted} spent OTP code(s), ${result.resetTokensDeleted} spent reset token(s)`);
+    console.log(`[retention] deleted ${result.messagesDeleted} old message(s), ${result.otpDeleted} spent OTP code(s), ${result.resetTokensDeleted} spent reset token(s), ${result.sendLogDeleted} old send-log row(s)`);
   };
   sweep(); // once at boot, then daily — no external cron needed (plan 10)
   setInterval(sweep, SWEEP_INTERVAL_MS);
