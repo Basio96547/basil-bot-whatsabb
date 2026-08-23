@@ -6,7 +6,12 @@ module.exports = {
       name: 'sms-api',
       script: 'src/index.ts',
       interpreter: 'node',
-      interpreter_args: '--import tsx',
+      // سقف كومة V8 مضبوط تحت max_memory_restart بهامش. بلا هذا، V8 يقدّر
+      // الحد من ذاكرة الجهاز كلها (جيغابايتات) فيؤجّل الكنس، فتنمو الكومة
+      // بهدوء حتى يقتلها pm2 عند ٤٠٠ ميغا — وكل قتلة تعني إقلاع Node وترجمة
+      // TypeScript وإعادة ربط واتساب من الصفر، وهو أكبر مصدر حرارة في هذا
+      // الإعداد. إخبار V8 بالحد يجعله يكنس قبل الاصطدام بدل أن يصطدم.
+      interpreter_args: '--import tsx --max-old-space-size=256',
       cwd: __dirname,
       autorestart: true,
       restart_delay: 3000,
@@ -25,7 +30,13 @@ module.exports = {
       // عادةً بلا IP عام (خصوصاً على نت الموبايل). راجع README قسم الشبكة.
       name: 'cloudflared-tunnel',
       script: 'cloudflared',
-      args: 'tunnel run sms-api',
+      // --ha-connections 1: cloudflared يفتح أربعة اتصالات QUIC إلى حافة
+      // كلاودفلير افتراضياً، لكلٍّ منها نبضات إبقاء مستقلة. هذا منطقي على
+      // خادم يخدم آلاف الطلبات؛ على جوال يخدم رسالة تحقق بين حين وآخر فهو
+      // أربعة أضعاف إيقاظ الراديو مقابل احتياط لا يُستعمل. واحد يكفي.
+      // --no-autoupdate: يمنع فحص التحديث الدوري، ويمنع أسوأ منه — إعادة
+      // تشغيل ذاتية للتونيل في منتصف الليل على جهاز لا أحد يراقبه.
+      args: 'tunnel --no-autoupdate --ha-connections 1 run sms-api',
       autorestart: true,
       restart_delay: 3000,
     },

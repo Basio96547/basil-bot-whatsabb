@@ -1,6 +1,7 @@
 import { db } from '../db.ts';
 import { config } from '../config.ts';
 import { toSqliteUtc } from '../utils.ts';
+import { notifyWork } from './wakeup.ts';
 import type { Channel } from '../whatsapp/existence.ts';
 
 // A notification that shows up a day late is noise, not service — but unlike
@@ -42,6 +43,9 @@ export function enqueue(input: EnqueueInput): EnqueueResult {
     JSON.stringify(input.payload),
     toSqliteUtc(Date.now() + ttlMinutes * 60_000),
   );
+  // العامل نائم نوماً طويلاً عند الخمول (راجع wakeup.ts) — بدون هذا السطر
+  // ستنتظر رسالة عاجلة دورةَ الخمول كاملة قبل أن يراها أحد.
+  notifyWork();
   return { ok: true, id: Number(result.lastInsertRowid) };
 }
 

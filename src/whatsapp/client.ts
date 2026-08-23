@@ -9,6 +9,7 @@ import pino from 'pino';
 import { config } from '../config.ts';
 import { scheduleSessionBackup, restoreSessionFromR2, restoreFromLocal } from './sessionBackup.ts';
 import { probeCreds, useAtomicMultiFileAuthState } from './authState.ts';
+import { notifyWork } from '../queue/wakeup.ts';
 
 const logger = pino({ level: 'silent' }); // Baileys' own internal logger — noisy at 'info', we log our own lines below
 const app = { info: (m: string) => console.log(m), error: (m: string, e?: unknown) => console.error(m, e ?? '') };
@@ -54,6 +55,33 @@ export function getConnectionState(): ConnectionState {
 }
 
 let socket: WASocket | null = null;
+
+// نداء شبكة خارجي عند كل محاولة اتصال. في يوم عادي هو نداء واحد، أما في
+// نوبة انقطاع فهو نداء كل ٦٠ ثانية إلى الأبد — إيقاظ للراديو ومعالجة بلا
+// طائل. مهلة ٦ ساعات تكفي لتفادي ذلك دون تجميد الإصدار: بروتوكول واتساب
+// يتغيّر بمقياس أسابيع، وتخزينه للأبد كان سيحوّل خدمة تعمل منذ شهر إلى خدمة
+// تُرفض بإصدار قديم دون سبب ظاهر.
+const VERSION_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+let cachedVersion: Awaited<ReturnType<typeof fetchLatestBaileysVersion>>['version'] | null = null;
+let cachedVersionAt = 0;
+
+async function getProtocolVersion(): Promise<NonNullable<typeof cachedVersion>> {
+  if (cachedVersion && Date.now() - cachedVersionAt < VERSION_CACHE_TTL_MS) return cachedVersion;
+  try {
+    const { version } = await fetchLatestBaileysVersion();
+    cachedVersion = version;
+    cachedVersionAt = Date.now();
+    return version;
+  } catch (err) {
+    // نسخة قديمة أفضل من لا اتصال: الشبكة تسقط على هذا الجوال بانتظام، وبلا
+    // هذا الرجوع كان فشل هذا النداء وحده يُسقط محاولة الاتصال كلها.
+    if (cachedVersion) {
+      app.error('[whatsapp] تعذّر تحديث إصدار البروتوكول — استُعملت النسخة المحفوظة', err);
+      return cachedVersion;
+    }
+    throw err;
+  }
+}
 
 export function getSocket(): WASocket {
   if (!socket) throw new Error('WhatsApp socket not initialized yet');
@@ -147,7 +175,7 @@ export async function connectWhatsApp(): Promise<void> {
     app.error(`[whatsapp] ${state.sessionNote}`);
   }
 
-  const { version } = await fetchLatestBaileysVersion();
+  const version = await getProtocolVersion();
 
   const previousSocket = socket;
   const myGeneration = ++generation;
@@ -193,6 +221,10 @@ export async function connectWhatsApp(): Promise<void> {
       state.sessionNote = null;
       reconnectAttempt = 0;
       app.info('[whatsapp] متصل');
+      // العامل يتراجع إلى نبضة الدقيقة أثناء الانقطاع (راجع queue/wakeup.ts)
+      // — بلا هذه الإشارة سيظل الطابور المتراكم واقفاً بعد عودة الاتصال حتى
+      // تنتهي دورة الخمول الطويلة.
+      notifyWork();
       // First snapshot of a newly-paired or newly-restored session. Without
       // this, a session paired and then lost before any creds.update would
       // have no backup at all.
