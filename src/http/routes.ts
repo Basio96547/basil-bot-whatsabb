@@ -8,7 +8,15 @@ import { config } from '../config.ts';
 
 export const router = Router();
 
-const PHONE_RE = /^\d{8,15}$/; // digits-only, international format — no '+', no leading 0 (plan 4.2)
+// digits-only, international format — no '+', no leading 0 (plan 4.2).
+//
+// `[1-9]` first, not `\d`: the old `^\d{8,15}$` said "no leading 0" in its
+// comment and accepted one anyway. A Syrian caller passing the local form
+// `0958436703` sailed through, and the damage came later — the number was
+// queued, resolved to WhatsApp, and every send attempt hung until the 15s
+// timeout, five times over, holding the worker each time. A malformed
+// recipient is cheap to reject here and expensive everywhere after.
+export const PHONE_RE = /^[1-9]\d{7,14}$/;
 
 router.post('/notify', (req, res) => {
   const project = req.project!;
