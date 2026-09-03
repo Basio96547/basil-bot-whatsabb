@@ -72,6 +72,7 @@ router.post('/otp/request', (req, res) => {
 
 type IssueOutcome =
   | { kind: 'queued'; id: number }
+  | { kind: 'already_sent'; retryAfterSeconds: number; expiresInSeconds: number }
   | { kind: 'rejected'; error: string; retryAfterSeconds?: number };
 
 export function issueAndQueue(
@@ -86,7 +87,14 @@ export function issueAndQueue(
     const purpose = event === 'otp' ? 'login' : 'password_reset';
     const generated = generateOtp(project, to, purpose);
     if (!generated.ok) {
-      rejection = { kind: 'rejected', error: generated.reason, retryAfterSeconds: generated.retryAfterSeconds };
+      rejection =
+        generated.reason === 'already_sent'
+          ? {
+              kind: 'already_sent',
+              retryAfterSeconds: generated.retryAfterSeconds,
+              expiresInSeconds: generated.expiresInSeconds,
+            }
+          : { kind: 'rejected', error: generated.reason, retryAfterSeconds: generated.retryAfterSeconds };
       return null; // rolls back
     }
 
@@ -113,6 +121,25 @@ export function issueAndQueue(
 function respondToIssue(res: Response, outcome: IssueOutcome): void {
   if (outcome.kind === 'queued') {
     res.status(202).json({ id: outcome.id, status: 'queued' });
+    return;
+  }
+  // 202, like a fresh send — because from the caller's point of view the thing
+  // they asked for is true: this customer has a code on the way. Answering 429
+  // here was actively harmful (see generateOtp's `already_sent` branch): a
+  // request that succeeded but timed out at the caller left the site insisting
+  // nothing was sent while the code was arriving.
+  //
+  // Deliberately the SAME status a fresh send returns, so the existing clients
+  // — which treat only 202 as success — do the right thing before they are
+  // updated to read `alreadySent`. It is also less leaky than the old 429,
+  // which told any prober that this number had asked for a code recently.
+  if (outcome.kind === 'already_sent') {
+    res.status(202).json({
+      status: 'already_sent',
+      alreadySent: true,
+      retryAfterSeconds: outcome.retryAfterSeconds,
+      expiresInSeconds: outcome.expiresInSeconds,
+    });
     return;
   }
   res.status(429).json({ error: outcome.error, retryAfterSeconds: outcome.retryAfterSeconds });

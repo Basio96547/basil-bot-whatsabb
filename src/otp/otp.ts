@@ -43,6 +43,9 @@ const countRecentSends = db.prepare(`
 
 export type GenerateResult =
   | { ok: true; code: string }
+  // A live, unspent code already exists for this number. Distinct from
+  // `cooldown` on purpose — see the branch below.
+  | { ok: false; reason: 'already_sent'; retryAfterSeconds: number; expiresInSeconds: number }
   | { ok: false; reason: 'cooldown' | 'daily_limit'; retryAfterSeconds: number };
 
 export function generateOtp(project: ProjectConfig, phone: string, purpose = 'login'): GenerateResult {
@@ -59,14 +62,42 @@ export function generateOtp(project: ProjectConfig, phone: string, purpose = 'lo
   }
 
   const latest = selectLatest.get(project.id, phone, purpose) as
-    | { created_at: string }
+    | { created_at: string; expires_at: string; verified_at: string | null }
     | undefined;
 
   if (latest) {
     const elapsedMs = Date.now() - new Date(`${latest.created_at}Z`).getTime();
     const cooldownMs = project.resendCooldownMinutes * 60_000;
     if (elapsedMs < cooldownMs) {
-      return { ok: false, reason: 'cooldown', retryAfterSeconds: Math.ceil((cooldownMs - elapsedMs) / 1000) };
+      const retryAfterSeconds = Math.ceil((cooldownMs - elapsedMs) / 1000);
+      const expiresInMs = new Date(`${latest.expires_at}Z`).getTime() - Date.now();
+
+      // A code that is still valid and still unused changes the answer
+      // entirely: the caller's real question is "will this customer get a
+      // code?", and they already have one.
+      //
+      // This is what makes a request that SUCCEEDED but timed out at the
+      // caller recoverable. The clients give up after 8 seconds, and this
+      // phone's network is documented to stall for minutes — so the request
+      // lands, the code is issued and queued, the response never arrives, and
+      // the site tells the customer it failed. Their retry then hit a bare
+      // `cooldown` error, i.e. "you asked recently, wait 10 minutes", while
+      // the code was arriving on WhatsApp seconds later with the UI insisting
+      // nothing had been sent and no way to ask again.
+      //
+      // Reported as a distinct reason so the caller can say "check WhatsApp,
+      // your code is on its way" and move the customer to the code screen.
+      // No new message is sent and no quota is spent, so the cooldown's actual
+      // job is untouched — only what we TELL the caller changes.
+      if (!latest.verified_at && expiresInMs > 0) {
+        return {
+          ok: false,
+          reason: 'already_sent',
+          retryAfterSeconds,
+          expiresInSeconds: Math.ceil(expiresInMs / 1000),
+        };
+      }
+      return { ok: false, reason: 'cooldown', retryAfterSeconds };
     }
   }
 

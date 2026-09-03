@@ -36,7 +36,7 @@ function counts(): { codes: number; sendLog: number; messages: number } {
 }
 
 /** Exercises the real route helper, not a copy of it. */
-function issue(phone: string): 'queued' | 'rejected' {
+function issue(phone: string): 'queued' | 'already_sent' | 'rejected' {
   return issueAndQueue(store, phone, 'otp', store.otpExpiryMinutes).kind;
 }
 
@@ -80,6 +80,46 @@ test('after a refused queue the customer can still request a code once there is 
   db.exec("UPDATE messages SET status = 'sent'");
 
   assert.equal(issue('963900001003'), 'queued', 'يجب أن يستطيع طلب رمز جديد فوراً');
+});
+
+test('a repeat request while a live code exists reports already_sent, not a cooldown error', () => {
+  // The recovery path for a request that SUCCEEDED but timed out at the
+  // caller: the clients give up after 8s and this phone's network is
+  // documented to stall for minutes, so the site can report failure while the
+  // code is on its way. The retry must say "you already have one", not
+  // "you asked recently, wait" — and must not send a second message or spend
+  // another of the day's codes.
+  clear();
+  assert.equal(issue('963900001010'), 'queued');
+  const before = counts();
+
+  const outcome = issueAndQueue(store, '963900001010', 'otp', store.otpExpiryMinutes);
+  assert.equal(outcome.kind, 'already_sent');
+  assert.ok(outcome.kind === 'already_sent' && outcome.expiresInSeconds > 0, 'يخبر بالمدة المتبقية للرمز');
+
+  assert.deepEqual(counts(), before, 'لا رسالة جديدة ولا خانة حصة مستهلكة');
+});
+
+test('a spent code falls back to a plain cooldown, not already_sent', () => {
+  // Once the code has been used, "you already have one" would be a lie — the
+  // customer has nothing usable, and the cooldown is the honest answer.
+  clear();
+  assert.equal(issue('963900001011'), 'queued');
+  db.exec("UPDATE otp_codes SET verified_at = datetime('now')");
+
+  const outcome = issueAndQueue(store, '963900001011', 'otp', store.otpExpiryMinutes);
+  assert.equal(outcome.kind, 'rejected');
+  assert.equal(outcome.kind === 'rejected' && outcome.error, 'cooldown');
+});
+
+test('an expired code also falls back to a plain cooldown', () => {
+  clear();
+  assert.equal(issue('963900001012'), 'queued');
+  db.exec("UPDATE otp_codes SET expires_at = datetime('now', '-1 minutes')");
+
+  const outcome = issueAndQueue(store, '963900001012', 'otp', store.otpExpiryMinutes);
+  assert.equal(outcome.kind, 'rejected');
+  assert.equal(outcome.kind === 'rejected' && outcome.error, 'cooldown');
 });
 
 test('a throw inside the transaction rolls back too', () => {
