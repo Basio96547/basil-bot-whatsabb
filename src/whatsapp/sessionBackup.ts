@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import { readdirSync, readFileSync, mkdirSync, writeFileSync, renameSync, rmSync } from 'node:fs';
+import { readdirSync, readFileSync, mkdirSync, writeFileSync, renameSync, rmSync, existsSync } from 'node:fs';
 import path from 'node:path';
 import { S3Client, PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
 import { config } from '../config.ts';
@@ -91,15 +91,53 @@ function writeFileAtomic(filePath: string, contents: string): void {
 }
 
 export function snapshotLocal(): number {
-  // Cleared first so keys deleted from the live folder don't linger here and
-  // get restored later as stale signal state.
-  rmSync(LOCAL_BACKUP_DIR, { recursive: true, force: true });
-  mkdirSync(LOCAL_BACKUP_DIR, { recursive: true });
+  // Built in a staging directory and swapped in by rename, NOT written over
+  // the live backup.
+  //
+  // The old order deleted the backup first and then copied ~7500 files in one
+  // by one, so anything that interrupted the copy — pm2's memory kill, the
+  // low-memory killer, a power cut, or simply Baileys unlinking a signal key
+  // mid-copy — left the backup missing or half-written. That is the exact
+  // moment the backup exists for. Worse, restoreFromLocal only checks that
+  // creds.json parses, so a partial snapshot passes validation and gets
+  // restored as a session that authenticates but cannot decrypt.
+  //
+  // Every individual file write in this codebase is already atomic; the
+  // directory replace was the one step that wasn't.
+  const staging = `${LOCAL_BACKUP_DIR}.new`;
+  const previous = `${LOCAL_BACKUP_DIR}.old`;
+
+  rmSync(staging, { recursive: true, force: true });
+  mkdirSync(staging, { recursive: true });
 
   const files = readdirSync(AUTH_DIR).filter((name) => name.endsWith('.json'));
   for (const name of files) {
-    writeFileAtomic(path.join(LOCAL_BACKUP_DIR, name), readFileSync(path.join(AUTH_DIR, name), 'utf-8'));
+    // A key deleted between readdir and readFile is skipped rather than
+    // aborting the whole snapshot — it is gone from the live session anyway.
+    let contents: string;
+    try {
+      contents = readFileSync(path.join(AUTH_DIR, name), 'utf-8');
+    } catch {
+      continue;
+    }
+    writeFileAtomic(path.join(staging, name), contents);
   }
+
+  // creds.json is what makes a snapshot usable at all; without it the staging
+  // copy is worthless and must not replace a good backup.
+  if (!existsSync(path.join(staging, 'creds.json'))) {
+    rmSync(staging, { recursive: true, force: true });
+    throw new Error('snapshot aborted: creds.json missing from the live session');
+  }
+
+  // Swap: move the current backup aside, promote staging, then drop the old
+  // one. A crash between the renames leaves either the old or the new backup
+  // in place — never a partial directory.
+  rmSync(previous, { recursive: true, force: true });
+  if (existsSync(LOCAL_BACKUP_DIR)) renameSync(LOCAL_BACKUP_DIR, previous);
+  renameSync(staging, LOCAL_BACKUP_DIR);
+  rmSync(previous, { recursive: true, force: true });
+
   return files.length;
 }
 
@@ -115,6 +153,19 @@ export function restoreFromLocal(): { ok: true; files: number } | { ok: false; r
   try {
     mkdirSync(AUTH_DIR, { recursive: true });
     const files = readdirSync(LOCAL_BACKUP_DIR).filter((name) => name.endsWith('.json'));
+
+    // Stale keys in the live folder are removed, not left in place. Copying the
+    // backup *over* the live folder kept every key the backup didn't contain,
+    // producing a hybrid of an older identity and newer session keys that no
+    // snapshot ever produced — it can connect and then fail to decrypt.
+    // snapshotLocal clears its own target for exactly this reason.
+    const restored = new Set(files);
+    for (const name of readdirSync(AUTH_DIR)) {
+      if (name.endsWith('.json') && !restored.has(name)) {
+        rmSync(path.join(AUTH_DIR, name), { force: true });
+      }
+    }
+
     for (const name of files) {
       writeFileAtomic(path.join(AUTH_DIR, name), readFileSync(path.join(LOCAL_BACKUP_DIR, name), 'utf-8'));
     }
@@ -164,6 +215,13 @@ export async function restoreSessionFromR2(): Promise<RestoreResult> {
 }
 
 let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+// When the first postponed snapshot became due. The debounce restarted its
+// timer on every creds.update with no ceiling, so a burst of updates arriving
+// faster than every 30s postponed the snapshot for as long as the burst
+// lasted — precisely when the session is changing fastest and a backup is most
+// valuable. Past this cap the pending snapshot runs regardless of new events.
+const MAX_DEBOUNCE_MS = 5 * 60_000;
+let firstDeferredAt = 0;
 
 /**
  * `isEligible` is the rule that makes this safe to run automatically: a
@@ -176,9 +234,17 @@ export function scheduleSessionBackup(
   logger: { info: (msg: string) => void; error: (msg: string, err: unknown) => void },
   isEligible: () => boolean,
 ): void {
+  const now = Date.now();
+  if (!debounceTimer) firstDeferredAt = now;
+
+  // Already waited the cap: let the pending timer fire instead of pushing it
+  // back again.
+  if (debounceTimer && now - firstDeferredAt >= MAX_DEBOUNCE_MS) return;
+
   if (debounceTimer) clearTimeout(debounceTimer);
   debounceTimer = setTimeout(() => {
     debounceTimer = null;
+    firstDeferredAt = 0;
     if (!isEligible()) return;
 
     try {

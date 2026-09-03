@@ -34,6 +34,48 @@ function writeSession(creds: object, extra: Record<string, object> = {}): void {
   }
 }
 
+test('a snapshot that cannot produce creds.json leaves the previous backup intact', () => {
+  // The old order deleted the backup first and copied afterwards, so anything
+  // that interrupted the copy destroyed the only recovery path — at exactly
+  // the moment it was needed. The backup is now built aside and swapped in, so
+  // a snapshot that cannot complete must leave the good one untouched.
+  reset();
+  writeSession({ registrationId: 1 }, { 'session-a': { k: 1 } });
+  assert.equal(snapshotLocal(), 2);
+  const goodCreds = readFileSync(path.join(BACKUP_DIR, 'creds.json'), 'utf-8');
+
+  // Live session loses creds.json (the state a wipe or a torn write leaves).
+  rmSync(path.join(AUTH_DIR, 'creds.json'), { force: true });
+  assert.throws(() => snapshotLocal(), /creds\.json/);
+
+  assert.ok(existsSync(BACKUP_DIR), 'النسخة القديمة يجب أن تبقى');
+  assert.equal(
+    readFileSync(path.join(BACKUP_DIR, 'creds.json'), 'utf-8'),
+    goodCreds,
+    'النسخة القديمة يجب أن تبقى كما هي بلا تعديل',
+  );
+  assert.ok(!existsSync(`${BACKUP_DIR}.new`), 'لا يُترك مجلد مؤقت خلفه');
+});
+
+test('restore removes live keys the backup does not contain, instead of merging', () => {
+  // Copying the backup *over* the live folder kept every key the backup didn't
+  // have, producing a hybrid identity that no snapshot ever produced: it can
+  // authenticate and then fail to decrypt.
+  reset();
+  writeSession({ registrationId: 7 }, { 'session-old': { k: 1 } });
+  assert.equal(snapshotLocal(), 2);
+
+  // A key appears in the live session AFTER the snapshot, then creds are lost.
+  writeFileSync(path.join(AUTH_DIR, 'session-new.json'), JSON.stringify({ k: 2 }), 'utf-8');
+  writeFileSync(path.join(AUTH_DIR, 'creds.json'), '{"trunc', 'utf-8');
+
+  const result = restoreFromLocal();
+  assert.equal(result.ok, true);
+
+  const live = readdirSync(AUTH_DIR).filter((n) => n.endsWith('.json')).sort();
+  assert.deepEqual(live, ['creds.json', 'session-old.json'], 'المفتاح الأحدث من النسخة يجب أن يُزال');
+});
+
 test('a corrupt session is recovered from the local snapshot', () => {
   reset();
   writeSession({ registrationId: 4242 }, { 'session-device-1': { k: 1 } });
