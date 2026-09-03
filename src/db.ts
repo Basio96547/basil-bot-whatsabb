@@ -95,6 +95,17 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_otp_send_log_lookup ON otp_send_log(project, phone, purpose, created_at);
 
+  -- When the CURRENT WhatsApp identity first connected, keyed by its own JID.
+  -- Needed by the send-rate warm-up: a freshly paired number must send at a
+  -- fraction of the normal ceiling for its first hours, and that clock has to
+  -- survive process restarts (otherwise every restart looks like a fresh
+  -- pairing, or the warm-up is skipped entirely). A different JID means a
+  -- genuine re-pair and starts a new clock.
+  CREATE TABLE IF NOT EXISTS session_state (
+    me_id     TEXT PRIMARY KEY,
+    paired_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
   CREATE TABLE IF NOT EXISTS reset_tokens (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     project    TEXT NOT NULL,

@@ -6,6 +6,8 @@ import { getConnectionState } from '../whatsapp/client.ts';
 import { knownEvents } from '../templates/templates.ts';
 import { config, type ProjectConfig } from '../config.ts';
 import { inTransaction } from '../db.ts';
+import { checkSendRate } from '../queue/sendRate.ts';
+import { activeEnforcement } from '../whatsapp/enforcement.ts';
 
 export const router = Router();
 
@@ -223,6 +225,15 @@ router.get('/health', (_req, res) => {
   // /health still answering `ok`.
   if (oldestPendingSeconds > QUEUE_STALL_SECONDS) reasons.push('queue_stalled');
 
+  // A restriction WhatsApp announced itself. The most actionable state there
+  // is — it names its own end time, and re-pairing before then is the one
+  // thing that can extend it — so it must reach the monitor, not just a log.
+  const enforcement = activeEnforcement();
+  if (enforcement) reasons.push('account_restricted');
+
+  const rate = checkSendRate(wa.pairedAtMs);
+  if (!rate.allowed) reasons.push('send_rate_ceiling');
+
   const degraded = reasons.length > 0 && !(reasons.length === 1 && reasons[0] === 'session_restored_from_backup');
 
   res.status(degraded ? 503 : 200).json({
@@ -230,5 +241,9 @@ router.get('/health', (_req, res) => {
     reasons,
     whatsapp: wa,
     queue: { pending, maxPending: config.queue.maxPending, oldestPendingSeconds },
+    sendRate: { used: rate.used, limit: rate.limit, warmingUp: rate.warmingUp },
+    enforcement: enforcement
+      ? { type: enforcement.type, endsAt: new Date(enforcement.endsAtMs).toISOString() }
+      : null,
   });
 });

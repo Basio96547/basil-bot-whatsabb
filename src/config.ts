@@ -87,6 +87,36 @@ export const config = {
   otpHashSecret: requireEnv('OTP_HASH_SECRET'),
   whatsappNumber: process.env.WHATSAPP_NUMBER ?? '',
 
+  whatsapp: {
+    // Doubled from Baileys' 30s default: each keep-alive wakes the phone's
+    // radio. Configurable because raising it too far lets the server drop the
+    // socket as idle, which costs a reconnect — and reconnect churn on an
+    // unofficial client is itself a ban signal.
+    keepAliveIntervalMs: Number(process.env.KEEP_ALIVE_INTERVAL_MS ?? 60_000),
+  },
+
+  // Ceiling on TOTAL messages leaving this service, independent of the
+  // per-number caps.
+  //
+  // The per-number limits (otpMaxPerDay, resendCooldownMinutes) bound what any
+  // ONE recipient can receive, but nothing bounded the aggregate: a campaign,
+  // a launch, or a burst of signups could push hundreds of messages through a
+  // single unofficial WhatsApp account in an hour. That volume pattern — not
+  // any individual message — is what gets a sending number restricted, and
+  // this account has already been hit with RESTRICT_ALL_COMPANIONS once.
+  //
+  // Exceeding it delays messages rather than dropping them: the queue simply
+  // stops draining until the window rolls, and short-lived OTPs expire out on
+  // their own TTL instead of arriving stale.
+  sendRate: {
+    maxPerHour: Number(process.env.SEND_MAX_PER_HOUR ?? 120),
+    // A freshly paired number is at its most fragile — this is exactly when a
+    // re-pair after an enforcement happens. Its first hours run at a fraction
+    // of the normal ceiling.
+    warmupHours: Number(process.env.SEND_WARMUP_HOURS ?? 24),
+    warmupMaxPerHour: Number(process.env.SEND_WARMUP_MAX_PER_HOUR ?? 30),
+  },
+
   sessionBackup: {
     encryptionKey: requireEnv('SESSION_BACKUP_ENCRYPTION_KEY'),
     r2AccountId: process.env.R2_ACCOUNT_ID ?? '',
