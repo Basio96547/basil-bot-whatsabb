@@ -11,9 +11,15 @@ function generateSixDigitCode(): string {
   return crypto.randomInt(0, 1_000_000).toString().padStart(6, '0');
 }
 
+// `id DESC` as the tie-break, not just created_at: SQLite's datetime('now')
+// has one-second granularity, so two codes issued inside the same second made
+// "the latest one" arbitrary — and both the cooldown check and verifyOtp read
+// it. Verification could then compare against the sibling row's hash and
+// reject the code the customer had just received, burning an attempt each try.
 const selectLatest = db.prepare(`
   SELECT id, code_hash, attempts, max_attempts, expires_at, verified_at, created_at
-  FROM otp_codes WHERE project = ? AND phone = ? AND purpose = ? ORDER BY created_at DESC LIMIT 1
+  FROM otp_codes WHERE project = ? AND phone = ? AND purpose = ?
+  ORDER BY created_at DESC, id DESC LIMIT 1
 `);
 
 const insertOtp = db.prepare(`

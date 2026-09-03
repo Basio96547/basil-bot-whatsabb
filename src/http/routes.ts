@@ -1,10 +1,11 @@
-import { Router } from 'express';
+import { Router, type Response } from 'express';
 import { enqueue, getStatus, countPending } from '../queue/queue.ts';
 import { generateOtp, verifyOtp } from '../otp/otp.ts';
 import { issueResetToken, validateResetToken } from '../passwordReset/passwordReset.ts';
 import { getConnectionState } from '../whatsapp/client.ts';
 import { knownEvents } from '../templates/templates.ts';
-import { config } from '../config.ts';
+import { config, type ProjectConfig } from '../config.ts';
+import { inTransaction } from '../db.ts';
 
 export const router = Router();
 
@@ -59,27 +60,61 @@ router.post('/otp/request', (req, res) => {
     return;
   }
 
-  const generated = generateOtp(project, to);
-  if (!generated.ok) {
-    res.status(429).json({ error: generated.reason, retryAfterSeconds: generated.retryAfterSeconds });
-    return;
-  }
-
-  // Past its own validity window the code is worse than no message at all —
-  // the recipient types in a number the server already rejects.
-  const enqueued = enqueue({
-    project: project.id,
-    event: 'otp',
-    recipient: to,
-    payload: { code: generated.code },
-    ttlMinutes: project.otpExpiryMinutes,
-  });
-  if (!enqueued.ok) {
-    res.status(429).json({ error: enqueued.reason });
-    return;
-  }
-  res.status(202).json({ id: enqueued.id, status: 'queued' });
+  // Issuing the code and queueing its message are one step: see inTransaction.
+  // Anything short of both succeeding must leave no trace, or the caller is
+  // told "try later" while holding a code they never received and a cooldown
+  // that blocks the retry.
+  const outcome = issueAndQueue(project, to, 'otp', project.otpExpiryMinutes);
+  respondToIssue(res, outcome);
 });
+
+type IssueOutcome =
+  | { kind: 'queued'; id: number }
+  | { kind: 'rejected'; error: string; retryAfterSeconds?: number };
+
+export function issueAndQueue(
+  project: ProjectConfig,
+  to: string,
+  event: 'otp' | 'password_reset',
+  ttlMinutes: number,
+): IssueOutcome {
+  let rejection: IssueOutcome | null = null;
+
+  const queued = inTransaction<{ id: number }>(() => {
+    const purpose = event === 'otp' ? 'login' : 'password_reset';
+    const generated = generateOtp(project, to, purpose);
+    if (!generated.ok) {
+      rejection = { kind: 'rejected', error: generated.reason, retryAfterSeconds: generated.retryAfterSeconds };
+      return null; // rolls back
+    }
+
+    // Past its own validity window the code is worse than no message at all —
+    // the recipient types in a number the server already rejects.
+    const enqueued = enqueue({
+      project: project.id,
+      event,
+      recipient: to,
+      payload: { code: generated.code },
+      ttlMinutes,
+    });
+    if (!enqueued.ok) {
+      rejection = { kind: 'rejected', error: enqueued.reason };
+      return null; // rolls back the code row AND its daily-quota row
+    }
+    return { id: enqueued.id };
+  });
+
+  if (queued) return { kind: 'queued', id: queued.id };
+  return rejection ?? { kind: 'rejected', error: 'unknown_error' };
+}
+
+function respondToIssue(res: Response, outcome: IssueOutcome): void {
+  if (outcome.kind === 'queued') {
+    res.status(202).json({ id: outcome.id, status: 'queued' });
+    return;
+  }
+  res.status(429).json({ error: outcome.error, retryAfterSeconds: outcome.retryAfterSeconds });
+}
 
 router.post('/otp/verify', (req, res) => {
   const project = req.project!;
@@ -107,24 +142,7 @@ router.post('/password-reset/request', (req, res) => {
     return;
   }
 
-  const generated = generateOtp(project, to, 'password_reset');
-  if (!generated.ok) {
-    res.status(429).json({ error: generated.reason, retryAfterSeconds: generated.retryAfterSeconds });
-    return;
-  }
-
-  const enqueued = enqueue({
-    project: project.id,
-    event: 'password_reset',
-    recipient: to,
-    payload: { code: generated.code },
-    ttlMinutes: project.otpExpiryMinutes,
-  });
-  if (!enqueued.ok) {
-    res.status(429).json({ error: enqueued.reason });
-    return;
-  }
-  res.status(202).json({ id: enqueued.id, status: 'queued' });
+  respondToIssue(res, issueAndQueue(project, to, 'password_reset', project.otpExpiryMinutes));
 });
 
 router.post('/password-reset/verify', (req, res) => {

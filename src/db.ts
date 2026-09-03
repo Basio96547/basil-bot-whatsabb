@@ -10,6 +10,39 @@ export const db = new DatabaseSync(path.join(config.dataDir, 'sms-api.db'));
 db.exec('PRAGMA journal_mode = WAL');
 db.exec('PRAGMA foreign_keys = ON');
 
+/**
+ * Runs `fn` inside a single SQLite transaction, rolling back if it throws or
+ * signals failure by returning `null`.
+ *
+ * Used to make "issue a code" and "queue its message" one indivisible step.
+ * They were two separate commits, so a queue that refused the message (or any
+ * throw in between) left the code row and the daily-quota row already written:
+ * the customer got an error, no message, one of their few daily codes gone,
+ * and — because an unexpired code blocks a new one — no way to retry for the
+ * whole resend cooldown.
+ *
+ * `fn` MUST be fully synchronous. node:sqlite is synchronous and this process
+ * shares one connection with the queue worker, so an `await` inside the
+ * transaction would let the worker's own statements join it and be rolled back
+ * along with ours.
+ */
+export function inTransaction<T>(fn: () => T | null): T | null {
+  db.exec('BEGIN IMMEDIATE');
+  let result: T | null;
+  try {
+    result = fn();
+  } catch (error) {
+    db.exec('ROLLBACK');
+    throw error;
+  }
+  if (result === null) {
+    db.exec('ROLLBACK');
+    return null;
+  }
+  db.exec('COMMIT');
+  return result;
+}
+
 db.exec(`
   CREATE TABLE IF NOT EXISTS messages (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
