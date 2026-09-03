@@ -1,5 +1,5 @@
 import { Router, type Response } from 'express';
-import { enqueue, getStatus, countPending } from '../queue/queue.ts';
+import { enqueue, getStatus, countPending, oldestPendingAgeSeconds } from '../queue/queue.ts';
 import { generateOtp, verifyOtp } from '../otp/otp.ts';
 import { issueResetToken, validateResetToken } from '../passwordReset/passwordReset.ts';
 import { getConnectionState } from '../whatsapp/client.ts';
@@ -199,8 +199,15 @@ router.get('/status/:id', (req, res) => {
 
 // Plan 9, point 7: reflects load, not just up/down, so a monitor catches
 // pressure building before anything actually crashes.
+// A queue that stops draining is the only reliable evidence that delivery is
+// broken. Sized well above the worker's own pacing (3-9s per message, batches
+// of 20) plus a reconnect cycle, so ordinary bursts and brief drops don't trip
+// it — but a stall does, within minutes.
+const QUEUE_STALL_SECONDS = 10 * 60;
+
 router.get('/health', (_req, res) => {
   const pending = countPending();
+  const oldestPendingSeconds = oldestPendingAgeSeconds();
   const wa = getConnectionState();
 
   // Named reasons rather than a bare boolean: the monitor polling this turns
@@ -211,6 +218,10 @@ router.get('/health', (_req, res) => {
   else if (!wa.connected) reasons.push('whatsapp_disconnected');
   if (wa.sessionOrigin === 'restored') reasons.push('session_restored_from_backup');
   if (pending > config.queue.maxPending * 0.8) reasons.push('queue_near_capacity');
+  // Capacity alone was never going to catch a stall: at real volume the queue
+  // never gets near 4000 rows, so sends could be failing for hours with
+  // /health still answering `ok`.
+  if (oldestPendingSeconds > QUEUE_STALL_SECONDS) reasons.push('queue_stalled');
 
   const degraded = reasons.length > 0 && !(reasons.length === 1 && reasons[0] === 'session_restored_from_backup');
 
@@ -218,6 +229,6 @@ router.get('/health', (_req, res) => {
     status: degraded ? 'degraded' : 'ok',
     reasons,
     whatsapp: wa,
-    queue: { pending, maxPending: config.queue.maxPending },
+    queue: { pending, maxPending: config.queue.maxPending, oldestPendingSeconds },
   });
 });

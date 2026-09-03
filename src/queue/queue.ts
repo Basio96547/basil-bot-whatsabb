@@ -104,3 +104,26 @@ export function getStatus(id: number, project: string) {
 export function countPending(): number {
   return (countPendingStmt.get() as { n: number }).n;
 }
+
+const oldestPendingStmt = db.prepare(
+  `SELECT MIN(created_at) AS oldest FROM messages WHERE status = 'pending'`,
+);
+
+/**
+ * Age in seconds of the oldest message still waiting, or 0 when the queue is
+ * empty.
+ *
+ * This is the signal /health was missing. WhatsApp reporting `connected` says
+ * only that the socket is up — it says nothing about whether anything is
+ * actually going out. With sends failing (a paused circuit breaker, a channel
+ * with no provider, a recipient the socket won't accept) messages simply sat
+ * pending, the queue never approached its 80%-of-5000 threshold at real
+ * volume, and /health answered `ok` indefinitely while not one customer
+ * received a code. A backlog that stops draining is visible here immediately.
+ */
+export function oldestPendingAgeSeconds(): number {
+  const row = oldestPendingStmt.get() as { oldest: string | null };
+  if (!row.oldest) return 0;
+  const ageMs = Date.now() - new Date(`${row.oldest}Z`).getTime();
+  return Math.max(0, Math.round(ageMs / 1000));
+}
