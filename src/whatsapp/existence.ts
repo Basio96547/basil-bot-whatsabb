@@ -1,7 +1,19 @@
 import { db } from '../db.ts';
 import { getSocket } from './client.ts';
 
-const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // plan 4.6: ~week per number
+// plan 4.6: ~week per number — but only for a POSITIVE result, which cannot go
+// stale in a way that hurts (a number that had WhatsApp keeps having it, and
+// if it stops the send itself fails and the worker falls back).
+const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+// A negative result is different: it means "route this number to SMS", and
+// with no SMS provider configured the worker marks the message
+// no_channel_available and permanently fails it on the first attempt. So a
+// customer who installs WhatsApp after being checked once could not receive a
+// code for a whole WEEK, and /status reported a hard failure that looks like a
+// bad number rather than a stale cache. Re-checked hourly instead: one extra
+// onWhatsApp call per number per hour, against locking a paying customer out.
+const NEGATIVE_CACHE_TTL_MS = 60 * 60 * 1000;
 
 const selectCached = db.prepare(`SELECT has_whatsapp, checked_at FROM whatsapp_status_cache WHERE phone = ?`);
 const upsertCache = db.prepare(`
@@ -15,7 +27,8 @@ export async function checkWhatsAppExists(digitsOnlyPhone: string): Promise<Exis
   const cached = selectCached.get(digitsOnlyPhone) as { has_whatsapp: number; checked_at: string } | undefined;
   if (cached) {
     const age = Date.now() - new Date(`${cached.checked_at}Z`).getTime();
-    if (age < CACHE_TTL_MS) return cached.has_whatsapp ? 'yes' : 'no';
+    const ttl = cached.has_whatsapp ? CACHE_TTL_MS : NEGATIVE_CACHE_TTL_MS;
+    if (age < ttl) return cached.has_whatsapp ? 'yes' : 'no';
   }
 
   try {

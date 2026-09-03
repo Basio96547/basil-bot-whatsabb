@@ -121,6 +121,16 @@ async function prepareSession(): Promise<void> {
   // only a successful 'open' below clears a previous warning.
   if (probe === 'ok') return;
 
+  // The file exists but could not be read right now (permissions, too many
+  // open handles, the OS busy). Restoring here would overwrite a session that
+  // is probably fine with an older snapshot — strictly worse than waiting for
+  // the reconnect backoff to try again.
+  if (probe === 'unreadable') {
+    state.sessionNote = 'تعذّر قراءة ملف الجلسة مؤقتاً — لن تُستعاد نسخة فوق جلسة قد تكون سليمة';
+    app.error(`[whatsapp] ${state.sessionNote}`);
+    return;
+  }
+
   const problem = probe === 'corrupt' ? 'ملف الجلسة تالف' : 'لا توجد جلسة محلية';
   app.info(`[whatsapp] ${problem} — محاولة الاستعادة`);
 
