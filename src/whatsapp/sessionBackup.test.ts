@@ -16,7 +16,12 @@ import path from 'node:path';
 
 process.env.DATA_DIR = mkdtempSync(path.join(tmpdir(), 'sms-api-backup-'));
 
-const { snapshotLocal, restoreFromLocal } = await import('./sessionBackup.ts');
+process.env.SESSION_BACKUP_ENCRYPTION_KEY ??= 'test-passphrase-for-backup-roundtrip';
+
+const { snapshotLocal, restoreFromLocal, encryptBundle, decryptBundle, encryptFragments } =
+  await import('./sessionBackup.ts');
+const crypto = await import('node:crypto');
+const zlib = await import('node:zlib');
 
 const AUTH_DIR = path.join(process.env.DATA_DIR, 'auth-session');
 const BACKUP_DIR = `${AUTH_DIR}-backup`;
@@ -33,6 +38,53 @@ function writeSession(creds: object, extra: Record<string, object> = {}): void {
     writeFileSync(path.join(AUTH_DIR, `${name}.json`), JSON.stringify(value), 'utf-8');
   }
 }
+
+test('an encrypted bundle round-trips', () => {
+  const payload = JSON.stringify({ 'creds.json': '{"registered":true}', 'session-a.json': '{"k":1}' });
+  assert.equal(decryptBundle(encryptBundle(payload)), payload);
+});
+
+test('the streaming encoder produces something the same decoder reads back', async () => {
+  // The R2 path no longer builds the ~45MB bundle as one string: it feeds
+  // fragments through gzip into the cipher. The two encoders must stay
+  // interchangeable, or a backup written by one cannot be restored by the other.
+  const parts = ['{', '"creds.json":"{\\"registered\\":true}"', ',"session-a.json":"{}"', '}'];
+  const blob = await encryptFragments(parts);
+  assert.equal(decryptBundle(blob), parts.join(''));
+});
+
+test('a bundle written BEFORE compression was added still restores', async () => {
+  // There is a live uncompressed bundle in R2 right now. Losing the ability to
+  // read it would mean the backup exists but cannot be used — the worst
+  // possible outcome for this feature.
+  const payload = JSON.stringify({ 'creds.json': '{"registered":true}' });
+  const key = crypto.createHash('sha256')
+    .update(process.env.SESSION_BACKUP_ENCRYPTION_KEY!)
+    .digest();
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  // The OLD format: raw utf-8 plaintext, no gzip layer.
+  const encrypted = Buffer.concat([cipher.update(payload, 'utf-8'), cipher.final()]);
+  const legacyBlob = Buffer.concat([iv, cipher.getAuthTag(), encrypted]);
+
+  assert.equal(decryptBundle(legacyBlob), payload);
+});
+
+test('compression actually shrinks a realistic session by a large factor', async () => {
+  // The whole point of the change: ~7500 near-identical key files are highly
+  // repetitive, so the retained ciphertext is a fraction of the plaintext.
+  const fragments: string[] = ['{'];
+  for (let i = 0; i < 400; i++) {
+    fragments.push(`${i ? ',' : ''}"session-${i}.json":${JSON.stringify(JSON.stringify({ k: i, pad: 'x'.repeat(200) }))}`);
+  }
+  fragments.push('}');
+  const plainSize = fragments.join('').length;
+
+  const blob = await encryptFragments(fragments);
+  assert.ok(blob.length * 4 < plainSize, `expected strong compression, got ${blob.length} from ${plainSize}`);
+  // And it still decodes to exactly the input.
+  assert.equal(decryptBundle(blob), fragments.join(''));
+});
 
 test('a snapshot that cannot produce creds.json leaves the previous backup intact', () => {
   // The old order deleted the backup first and copied afterwards, so anything

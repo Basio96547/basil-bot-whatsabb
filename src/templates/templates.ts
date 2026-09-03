@@ -84,17 +84,72 @@ export function validateVariants(event: string, variants: unknown): string | nul
   return null;
 }
 
+function variantsFor(event: string, overrides?: TemplateOverrides): string[] | undefined {
+  return overrides?.[event] ?? VARIANTS[event];
+}
+
+/**
+ * Placeholders the caller must supply for at least one variant of `event` to
+ * be renderable — empty when the payload is already sufficient.
+ *
+ * `AMBIENT_PLACEHOLDERS` are excluded because the worker injects them at send
+ * time, after this check runs.
+ *
+ * Exists so /notify can refuse an incomplete payload at the API boundary. The
+ * alternative is what used to happen: the message was accepted, queued, and
+ * delivered with the placeholder still in it — a real customer receiving
+ * "المبلغ المطلوب: {amount}".
+ */
+export function missingPlaceholders(
+  event: string,
+  payload: Record<string, unknown>,
+  overrides?: TemplateOverrides,
+): string[] {
+  const variants = variantsFor(event, overrides);
+  if (!variants || variants.length === 0) return [];
+
+  const missingPerVariant = variants.map((variant) =>
+    placeholdersIn(variant).filter(
+      (name) => !AMBIENT_PLACEHOLDERS.includes(name) && !(name in payload),
+    ),
+  );
+
+  // Any fully-satisfied variant means the send can go ahead — renderTemplate
+  // will pick among exactly those.
+  if (missingPerVariant.some((missing) => missing.length === 0)) return [];
+
+  // None can be rendered: report the smallest set that would fix it, so the
+  // caller is told the minimum it must add rather than every name in use.
+  const smallest = missingPerVariant.reduce((a, b) => (b.length < a.length ? b : a));
+  return [...new Set(smallest)];
+}
+
 export function renderTemplate(
   event: string,
   data: Record<string, string | number>,
   overrides?: TemplateOverrides,
 ): { text: string; variantIndex: number } {
-  const variants = overrides?.[event] ?? VARIANTS[event];
+  const variants = variantsFor(event, overrides);
   if (!variants) throw new Error(`Unknown template event: ${event}`);
 
-  const variantIndex = crypto.randomInt(0, variants.length);
-  const text = variants[variantIndex].replace(/\{(\w+)\}/g, (match, key) =>
+  // Only variants whose every placeholder is present are eligible. Picking at
+  // random across ALL of them meant an optional field (talisham's `name` and
+  // `amount` are both optional in its own types) turned into literal
+  // "{amount}" in the customer's WhatsApp — and only for the variants that
+  // happened to use it, so the same call site failed intermittently.
+  const eligible = variants
+    .map((text, index) => ({ text, index }))
+    .filter(({ text }) => placeholdersIn(text).every((name) => name in data));
+
+  if (eligible.length === 0) {
+    throw new Error(
+      `No renderable variant for "${event}": missing ${missingPlaceholders(event, data, overrides).join(', ')}`,
+    );
+  }
+
+  const chosen = eligible[crypto.randomInt(0, eligible.length)];
+  const text = chosen.text.replace(/\{(\w+)\}/g, (match, key) =>
     key in data ? String(data[key]) : match,
   );
-  return { text, variantIndex };
+  return { text, variantIndex: chosen.index };
 }

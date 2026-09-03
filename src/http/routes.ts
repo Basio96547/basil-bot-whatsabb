@@ -3,10 +3,11 @@ import { enqueue, getStatus, countPending, oldestPendingAgeSeconds } from '../qu
 import { generateOtp, verifyOtp } from '../otp/otp.ts';
 import { issueResetToken, validateResetToken } from '../passwordReset/passwordReset.ts';
 import { getConnectionState } from '../whatsapp/client.ts';
-import { knownEvents } from '../templates/templates.ts';
+import { knownEvents, missingPlaceholders } from '../templates/templates.ts';
 import { config, type ProjectConfig } from '../config.ts';
 import { inTransaction } from '../db.ts';
 import { checkSendRate } from '../queue/sendRate.ts';
+import { pausedChannels } from '../queue/circuitBreaker.ts';
 import { activeEnforcement } from '../whatsapp/enforcement.ts';
 
 export const router = Router();
@@ -38,11 +39,23 @@ router.post('/notify', (req, res) => {
     return;
   }
 
+  // Refuse an incomplete payload here rather than delivering the placeholder.
+  // talisham.com types `name` and `amount` as optional and posts the payload
+  // straight through, so a call omitting one used to reach the customer as
+  // "المبلغ المطلوب: {amount}" — intermittently, because the variant is
+  // chosen at random and only some of them use each field.
+  const safePayload = payload && typeof payload === 'object' ? (payload as Record<string, unknown>) : {};
+  const missing = missingPlaceholders(event, safePayload, project.templates);
+  if (missing.length > 0) {
+    res.status(400).json({ error: 'missing_placeholders', missing });
+    return;
+  }
+
   const result = enqueue({
     project: project.id,
     event,
     recipient: to,
-    payload: payload && typeof payload === 'object' ? payload : {},
+    payload: safePayload as Record<string, string | number>,
     channel,
   });
 
@@ -261,6 +274,11 @@ router.get('/health', (_req, res) => {
   const rate = checkSendRate(wa.pairedAtMs);
   if (!rate.allowed) reasons.push('send_rate_ceiling');
 
+  // A paused channel is a live reason nothing is going out, and it was
+  // previously invisible here — the pause state existed but nothing read it.
+  const paused = pausedChannels();
+  if (paused.length > 0) reasons.push('channel_paused');
+
   const degraded = reasons.length > 0 && !(reasons.length === 1 && reasons[0] === 'session_restored_from_backup');
 
   res.status(degraded ? 503 : 200).json({
@@ -269,6 +287,7 @@ router.get('/health', (_req, res) => {
     whatsapp: wa,
     queue: { pending, maxPending: config.queue.maxPending, oldestPendingSeconds },
     sendRate: { used: rate.used, limit: rate.limit, warmingUp: rate.warmingUp },
+    pausedChannels: paused,
     enforcement: enforcement
       ? { type: enforcement.type, endsAt: new Date(enforcement.endsAtMs).toISOString() }
       : null,

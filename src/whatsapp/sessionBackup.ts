@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import zlib from 'node:zlib';
 import { readdirSync, readFileSync, mkdirSync, writeFileSync, renameSync, rmSync, existsSync } from 'node:fs';
 import path from 'node:path';
 import { S3Client, PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
@@ -31,23 +32,85 @@ function deriveKey(): Buffer {
   return crypto.createHash('sha256').update(config.sessionBackup.encryptionKey).digest();
 }
 
-function bundleAuthFolder(): string {
-  const files = readdirSync(AUTH_DIR);
-  const bundle: Record<string, string> = {};
-  for (const file of files) {
-    bundle[file] = readFileSync(path.join(AUTH_DIR, file), 'utf-8');
+// Emits the bundle as a stream of JSON fragments instead of building it whole.
+//
+// The old version read all ~7500 session files into one object and
+// JSON.stringify'd it: a ~45 MB string, which the cipher then copied again,
+// and Buffer.concat again — several hundred megabytes of transient allocation
+// against `--max-old-space-size=256`, on a phone whose pm2 ceiling is 400 MB.
+// Every one of those kills forces a full WhatsApp reconnect, which
+// ecosystem.config.cjs calls the single biggest source of heat and the thing
+// that most raises the ban risk on an unofficial client.
+//
+// Now only one file is held at a time; peak retained memory is the compressed
+// ciphertext, which for this session is under a megabyte.
+function* bundleFragments(): Generator<string> {
+  const files = readdirSync(AUTH_DIR).filter((name) => name.endsWith('.json'));
+  yield '{';
+  let first = true;
+  for (const name of files) {
+    let contents: string;
+    try {
+      contents = readFileSync(path.join(AUTH_DIR, name), 'utf-8');
+    } catch {
+      continue; // Baileys deletes keys while we work — skip, don't abort
+    }
+    yield `${first ? '' : ','}${JSON.stringify(name)}:${JSON.stringify(contents)}`;
+    first = false;
   }
-  return JSON.stringify(bundle);
+  yield '}';
 }
 
-// Layout: [12-byte IV][16-byte auth tag][ciphertext] — self-contained, no
-// separate metadata file to lose track of.
+// Layout: [12-byte IV][16-byte auth tag][ciphertext] — unchanged, so a bundle
+// written by the previous version still decrypts. The PLAINTEXT is now gzipped
+// (the session is overwhelmingly repetitive JSON: ~45 MB becomes well under
+// 1 MB), which is detected on the way back out rather than assumed — see
+// decryptBundle.
 export function encryptBundle(plaintext: string): Buffer {
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv('aes-256-gcm', deriveKey(), iv);
-  const encrypted = Buffer.concat([cipher.update(plaintext, 'utf-8'), cipher.final()]);
+  const compressed = zlib.gzipSync(Buffer.from(plaintext, 'utf-8'));
+  const encrypted = Buffer.concat([cipher.update(compressed), cipher.final()]);
   return Buffer.concat([iv, cipher.getAuthTag(), encrypted]);
 }
+
+/**
+ * The streaming form: same output layout, without ever holding the whole
+ * plaintext. ASYNC because Node's zlib streams do their work on the threadpool
+ * — collecting their 'data' events synchronously would have produced an empty
+ * backup, which is worse than the memory problem this replaces.
+ */
+export async function encryptFragments(fragments: Iterable<string>): Promise<Buffer> {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', deriveKey(), iv);
+  const gzip = zlib.createGzip();
+
+  const out: Buffer[] = [];
+  const done = new Promise<void>((resolve, reject) => {
+    gzip.on('data', (chunk: Buffer) => out.push(cipher.update(chunk)));
+    gzip.on('end', resolve);
+    gzip.on('error', reject);
+  });
+
+  for (const fragment of fragments) {
+    // Respect backpressure: without this the whole bundle queues inside the
+    // gzip stream's buffer and we are back to holding it all in memory.
+    if (!gzip.write(fragment)) {
+      await new Promise<void>((resolve) => gzip.once('drain', resolve));
+    }
+  }
+  gzip.end();
+  await done;
+
+  if (out.length === 0) throw new Error('gzip produced no output — refusing to write an empty backup');
+
+  out.push(cipher.final());
+  return Buffer.concat([iv, cipher.getAuthTag(), ...out]);
+}
+
+// gzip's magic number. Bundles written before compression was added start with
+// '{' instead, and must keep restoring — there is a live one in R2 right now.
+const GZIP_MAGIC = [0x1f, 0x8b];
 
 export function decryptBundle(blob: Buffer): string {
   const iv = blob.subarray(0, 12);
@@ -55,7 +118,12 @@ export function decryptBundle(blob: Buffer): string {
   const ciphertext = blob.subarray(28);
   const decipher = crypto.createDecipheriv('aes-256-gcm', deriveKey(), iv);
   decipher.setAuthTag(authTag);
-  return Buffer.concat([decipher.update(ciphertext), decipher.final()]).toString('utf-8');
+  const plain = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+
+  if (plain.length >= 2 && plain[0] === GZIP_MAGIC[0] && plain[1] === GZIP_MAGIC[1]) {
+    return zlib.gunzipSync(plain).toString('utf-8');
+  }
+  return plain.toString('utf-8'); // pre-compression bundle
 }
 
 let s3Client: S3Client | null = null;
@@ -76,7 +144,7 @@ function getS3(): S3Client {
 export { BACKUP_KEY };
 
 async function runBackup(): Promise<void> {
-  const encrypted = encryptBundle(bundleAuthFolder());
+  const encrypted = await encryptFragments(bundleFragments());
   await getS3().send(
     new PutObjectCommand({ Bucket: config.sessionBackup.r2Bucket, Key: BACKUP_KEY, Body: encrypted }),
   );
