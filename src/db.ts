@@ -10,6 +10,39 @@ export const db = new DatabaseSync(path.join(config.dataDir, 'sms-api.db'));
 db.exec('PRAGMA journal_mode = WAL');
 db.exec('PRAGMA foreign_keys = ON');
 
+/**
+ * Runs `fn` inside a single SQLite transaction, rolling back if it throws or
+ * signals failure by returning `null`.
+ *
+ * Used to make "issue a code" and "queue its message" one indivisible step.
+ * They were two separate commits, so a queue that refused the message (or any
+ * throw in between) left the code row and the daily-quota row already written:
+ * the customer got an error, no message, one of their few daily codes gone,
+ * and — because an unexpired code blocks a new one — no way to retry for the
+ * whole resend cooldown.
+ *
+ * `fn` MUST be fully synchronous. node:sqlite is synchronous and this process
+ * shares one connection with the queue worker, so an `await` inside the
+ * transaction would let the worker's own statements join it and be rolled back
+ * along with ours.
+ */
+export function inTransaction<T>(fn: () => T | null): T | null {
+  db.exec('BEGIN IMMEDIATE');
+  let result: T | null;
+  try {
+    result = fn();
+  } catch (error) {
+    db.exec('ROLLBACK');
+    throw error;
+  }
+  if (result === null) {
+    db.exec('ROLLBACK');
+    return null;
+  }
+  db.exec('COMMIT');
+  return result;
+}
+
 db.exec(`
   CREATE TABLE IF NOT EXISTS messages (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -62,6 +95,17 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_otp_send_log_lookup ON otp_send_log(project, phone, purpose, created_at);
 
+  -- When the CURRENT WhatsApp identity first connected, keyed by its own JID.
+  -- Needed by the send-rate warm-up: a freshly paired number must send at a
+  -- fraction of the normal ceiling for its first hours, and that clock has to
+  -- survive process restarts (otherwise every restart looks like a fresh
+  -- pairing, or the warm-up is skipped entirely). A different JID means a
+  -- genuine re-pair and starts a new clock.
+  CREATE TABLE IF NOT EXISTS session_state (
+    me_id     TEXT PRIMARY KEY,
+    paired_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
   CREATE TABLE IF NOT EXISTS reset_tokens (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     project    TEXT NOT NULL,
@@ -74,13 +118,27 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_reset_tokens_hash ON reset_tokens(token_hash);
 `);
 
+// Runs a one-off `ALTER TABLE ... ADD COLUMN` migration, tolerating only the
+// one error that means "already migrated". A bare `catch {}` here would also
+// swallow a genuinely failed migration (disk full, a locked file) — the
+// column would then silently not exist, and the failure would only surface
+// later as a confusing "no such column" from an unrelated query.
+function addColumnIfMissing(sql: string): void {
+  try {
+    db.exec(sql);
+  } catch (error) {
+    if (error instanceof Error && error.message.includes('duplicate column name')) return;
+    throw error;
+  }
+}
+
 // Migration: add purpose column so login and password-reset OTPs have separate
 // cooldowns and cannot be cross-verified. Existing rows get 'login' by default.
-try { db.exec(`ALTER TABLE otp_codes ADD COLUMN purpose TEXT NOT NULL DEFAULT 'login'`); } catch { /* already exists */ }
+addColumnIfMissing(`ALTER TABLE otp_codes ADD COLUMN purpose TEXT NOT NULL DEFAULT 'login'`);
 
 // Migration: a queued message is only worth sending for so long. After a long
 // outage the queue drains in creation order, and without this an OTP that sat
 // there for an hour still went out — arriving as a code that expired 50
 // minutes ago. NULL means "no deadline" (rows queued before this column
 // existed, and any future event where late is still better than never).
-try { db.exec(`ALTER TABLE messages ADD COLUMN expires_at TEXT`); } catch { /* already exists */ }
+addColumnIfMissing(`ALTER TABLE messages ADD COLUMN expires_at TEXT`);

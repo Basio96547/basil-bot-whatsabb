@@ -6,6 +6,8 @@ import { sendSms } from '../sms/provider.ts';
 import { renderTemplate } from '../templates/templates.ts';
 import { isPaused, recordSuccess, recordFailure } from './circuitBreaker.ts';
 import { sleepUnlessWoken } from './wakeup.ts';
+import { checkSendRate } from './sendRate.ts';
+import { activeEnforcement } from '../whatsapp/enforcement.ts';
 
 const MAX_SEND_ATTEMPTS = 5;
 const SEND_TIMEOUT_MS = 15_000; // plan 9, point 5
@@ -169,6 +171,32 @@ async function loop(): Promise<void> {
     // Without this the loop would still walk the whole batch just to skip
     // every row. عودة واتساب تستدعي notifyWork() فتقطع هذا الانتظار فوراً.
     if (!getConnectionState().connected && !config.sms.enabled) {
+      await backOff();
+      continue;
+    }
+
+    // An active restriction from WhatsApp itself outranks everything: sending
+    // into it cannot succeed and can only make the enforcement worse. Nothing
+    // leaves until the window WhatsApp gave us has passed.
+    const enforcement = activeEnforcement();
+    if (enforcement) {
+      console.warn(
+        `[worker] حساب واتساب مقيَّد (${enforcement.type}) حتى ${new Date(enforcement.endsAtMs).toISOString()} — لا إرسال`,
+      );
+      await backOff();
+      continue;
+    }
+
+    // Global ceiling on what the SENDING ACCOUNT emits, checked before the
+    // batch is even read. Per-number caps bound one recipient; this bounds the
+    // aggregate volume, which is the dimension that gets a number restricted.
+    // Over the limit the queue simply stops draining — messages keep their
+    // place and their own TTL decides whether they are still worth sending.
+    const rate = checkSendRate(getConnectionState().pairedAtMs);
+    if (!rate.allowed) {
+      console.warn(
+        `[worker] بلغ سقف الإرسال (${rate.used}/${rate.limit} في الساعة${rate.warmingUp ? '، رقم حديث الربط' : ''}) — إيقاف مؤقت`,
+      );
       await backOff();
       continue;
     }

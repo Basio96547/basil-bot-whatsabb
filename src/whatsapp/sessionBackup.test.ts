@@ -16,7 +16,12 @@ import path from 'node:path';
 
 process.env.DATA_DIR = mkdtempSync(path.join(tmpdir(), 'sms-api-backup-'));
 
-const { snapshotLocal, restoreFromLocal } = await import('./sessionBackup.ts');
+process.env.SESSION_BACKUP_ENCRYPTION_KEY ??= 'test-passphrase-for-backup-roundtrip';
+
+const { snapshotLocal, restoreFromLocal, encryptBundle, decryptBundle, encryptFragments, quarantineLocal } =
+  await import('./sessionBackup.ts');
+const crypto = await import('node:crypto');
+const zlib = await import('node:zlib');
 
 const AUTH_DIR = path.join(process.env.DATA_DIR, 'auth-session');
 const BACKUP_DIR = `${AUTH_DIR}-backup`;
@@ -33,6 +38,95 @@ function writeSession(creds: object, extra: Record<string, object> = {}): void {
     writeFileSync(path.join(AUTH_DIR, `${name}.json`), JSON.stringify(value), 'utf-8');
   }
 }
+
+test('an encrypted bundle round-trips', () => {
+  const payload = JSON.stringify({ 'creds.json': '{"registered":true}', 'session-a.json': '{"k":1}' });
+  assert.equal(decryptBundle(encryptBundle(payload)), payload);
+});
+
+test('the streaming encoder produces something the same decoder reads back', async () => {
+  // The R2 path no longer builds the ~45MB bundle as one string: it feeds
+  // fragments through gzip into the cipher. The two encoders must stay
+  // interchangeable, or a backup written by one cannot be restored by the other.
+  const parts = ['{', '"creds.json":"{\\"registered\\":true}"', ',"session-a.json":"{}"', '}'];
+  const blob = await encryptFragments(parts);
+  assert.equal(decryptBundle(blob), parts.join(''));
+});
+
+test('a bundle written BEFORE compression was added still restores', async () => {
+  // There is a live uncompressed bundle in R2 right now. Losing the ability to
+  // read it would mean the backup exists but cannot be used — the worst
+  // possible outcome for this feature.
+  const payload = JSON.stringify({ 'creds.json': '{"registered":true}' });
+  const key = crypto.createHash('sha256')
+    .update(process.env.SESSION_BACKUP_ENCRYPTION_KEY!)
+    .digest();
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  // The OLD format: raw utf-8 plaintext, no gzip layer.
+  const encrypted = Buffer.concat([cipher.update(payload, 'utf-8'), cipher.final()]);
+  const legacyBlob = Buffer.concat([iv, cipher.getAuthTag(), encrypted]);
+
+  assert.equal(decryptBundle(legacyBlob), payload);
+});
+
+test('compression actually shrinks a realistic session by a large factor', async () => {
+  // The whole point of the change: ~7500 near-identical key files are highly
+  // repetitive, so the retained ciphertext is a fraction of the plaintext.
+  const fragments: string[] = ['{'];
+  for (let i = 0; i < 400; i++) {
+    fragments.push(`${i ? ',' : ''}"session-${i}.json":${JSON.stringify(JSON.stringify({ k: i, pad: 'x'.repeat(200) }))}`);
+  }
+  fragments.push('}');
+  const plainSize = fragments.join('').length;
+
+  const blob = await encryptFragments(fragments);
+  assert.ok(blob.length * 4 < plainSize, `expected strong compression, got ${blob.length} from ${plainSize}`);
+  // And it still decodes to exactly the input.
+  assert.equal(decryptBundle(blob), fragments.join(''));
+});
+
+test('a snapshot that cannot produce creds.json leaves the previous backup intact', () => {
+  // The old order deleted the backup first and copied afterwards, so anything
+  // that interrupted the copy destroyed the only recovery path — at exactly
+  // the moment it was needed. The backup is now built aside and swapped in, so
+  // a snapshot that cannot complete must leave the good one untouched.
+  reset();
+  writeSession({ registrationId: 1 }, { 'session-a': { k: 1 } });
+  assert.equal(snapshotLocal(), 2);
+  const goodCreds = readFileSync(path.join(BACKUP_DIR, 'creds.json'), 'utf-8');
+
+  // Live session loses creds.json (the state a wipe or a torn write leaves).
+  rmSync(path.join(AUTH_DIR, 'creds.json'), { force: true });
+  assert.throws(() => snapshotLocal(), /creds\.json/);
+
+  assert.ok(existsSync(BACKUP_DIR), 'النسخة القديمة يجب أن تبقى');
+  assert.equal(
+    readFileSync(path.join(BACKUP_DIR, 'creds.json'), 'utf-8'),
+    goodCreds,
+    'النسخة القديمة يجب أن تبقى كما هي بلا تعديل',
+  );
+  assert.ok(!existsSync(`${BACKUP_DIR}.new`), 'لا يُترك مجلد مؤقت خلفه');
+});
+
+test('restore removes live keys the backup does not contain, instead of merging', () => {
+  // Copying the backup *over* the live folder kept every key the backup didn't
+  // have, producing a hybrid identity that no snapshot ever produced: it can
+  // authenticate and then fail to decrypt.
+  reset();
+  writeSession({ registrationId: 7 }, { 'session-old': { k: 1 } });
+  assert.equal(snapshotLocal(), 2);
+
+  // A key appears in the live session AFTER the snapshot, then creds are lost.
+  writeFileSync(path.join(AUTH_DIR, 'session-new.json'), JSON.stringify({ k: 2 }), 'utf-8');
+  writeFileSync(path.join(AUTH_DIR, 'creds.json'), '{"trunc', 'utf-8');
+
+  const result = restoreFromLocal();
+  assert.equal(result.ok, true);
+
+  const live = readdirSync(AUTH_DIR).filter((n) => n.endsWith('.json')).sort();
+  assert.deepEqual(live, ['creds.json', 'session-old.json'], 'المفتاح الأحدث من النسخة يجب أن يُزال');
+});
 
 test('a corrupt session is recovered from the local snapshot', () => {
   reset();
@@ -83,4 +177,42 @@ test('snapshotting leaves no temp file for a later restore to trip over', () => 
     readdirSync(BACKUP_DIR).filter((f) => f.endsWith('.tmp')),
     [],
   );
+});
+
+// A real logout revokes the identity on WhatsApp's own servers, so the local
+// backup is just as dead as the live session — restoring it must stop being
+// possible, or prepareSession() would quietly bring the revoked session back.
+test('quarantining a session moves both the live folder and its backup aside, not deleted', () => {
+  reset();
+  writeSession({ registrationId: 1 }, { 'session-a': { k: 1 } });
+  snapshotLocal();
+  assert.ok(existsSync(AUTH_DIR));
+  assert.ok(existsSync(BACKUP_DIR));
+
+  quarantineLocal('test-suffix');
+
+  assert.ok(!existsSync(AUTH_DIR), 'live folder must no longer be at its expected path');
+  assert.ok(!existsSync(BACKUP_DIR), 'backup must no longer be at its expected path');
+  assert.ok(existsSync(`${AUTH_DIR}.test-suffix`), 'live folder must survive, renamed aside');
+  assert.ok(existsSync(`${BACKUP_DIR}.test-suffix`), 'backup must survive, renamed aside');
+  assert.equal(
+    JSON.parse(readFileSync(path.join(`${AUTH_DIR}.test-suffix`, 'creds.json'), 'utf-8')).registrationId,
+    1,
+    'the quarantined copy must be the real content, not an empty folder',
+  );
+});
+
+test('after quarantining, a restore correctly reports no_backup instead of reviving the dead identity', () => {
+  reset();
+  writeSession({ registrationId: 1 }, { 'session-a': { k: 1 } });
+  snapshotLocal();
+
+  quarantineLocal('test-suffix-2');
+
+  assert.deepEqual(restoreFromLocal(), { ok: false, reason: 'no_backup' });
+});
+
+test('quarantining when there is nothing to quarantine yet does not throw', () => {
+  reset();
+  assert.doesNotThrow(() => quarantineLocal('test-suffix-3'));
 });

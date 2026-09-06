@@ -27,9 +27,19 @@ export function isPaused(channel: string): boolean {
   return getState(channel).pausedUntil > Date.now();
 }
 
-export function pausedUntil(channel: string): Date | null {
-  const s = getState(channel);
-  return s.pausedUntil > Date.now() ? new Date(s.pausedUntil) : null;
+/**
+ * Channels currently in a circuit-breaker pause, with when each frees up.
+ *
+ * Surfaced on /health rather than left as dead API: a channel sitting in a
+ * 10-minute pause is a real reason nothing is being delivered, and it used to
+ * be invisible to the monitor — /health reported queue depth and WhatsApp
+ * state and never mentioned it.
+ */
+export function pausedChannels(): Array<{ channel: string; until: string }> {
+  const now = Date.now();
+  return [...channels.entries()]
+    .filter(([, s]) => s.pausedUntil > now)
+    .map(([channel, s]) => ({ channel, until: new Date(s.pausedUntil).toISOString() }));
 }
 
 export function recordSuccess(channel: string): void {

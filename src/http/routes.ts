@@ -1,10 +1,14 @@
-import { Router } from 'express';
-import { enqueue, getStatus, countPending } from '../queue/queue.ts';
+import { Router, type Response } from 'express';
+import { enqueue, getStatus, countPending, oldestPendingAgeSeconds } from '../queue/queue.ts';
 import { generateOtp, verifyOtp } from '../otp/otp.ts';
 import { issueResetToken, validateResetToken } from '../passwordReset/passwordReset.ts';
 import { getConnectionState } from '../whatsapp/client.ts';
-import { knownEvents } from '../templates/templates.ts';
-import { config } from '../config.ts';
+import { knownEvents, missingPlaceholders } from '../templates/templates.ts';
+import { config, type ProjectConfig } from '../config.ts';
+import { inTransaction } from '../db.ts';
+import { checkSendRate } from '../queue/sendRate.ts';
+import { pausedChannels } from '../queue/circuitBreaker.ts';
+import { activeEnforcement } from '../whatsapp/enforcement.ts';
 
 export const router = Router();
 
@@ -35,11 +39,23 @@ router.post('/notify', (req, res) => {
     return;
   }
 
+  // Refuse an incomplete payload here rather than delivering the placeholder.
+  // talisham.com types `name` and `amount` as optional and posts the payload
+  // straight through, so a call omitting one used to reach the customer as
+  // "المبلغ المطلوب: {amount}" — intermittently, because the variant is
+  // chosen at random and only some of them use each field.
+  const safePayload = payload && typeof payload === 'object' ? (payload as Record<string, unknown>) : {};
+  const missing = missingPlaceholders(event, safePayload, project.templates);
+  if (missing.length > 0) {
+    res.status(400).json({ error: 'missing_placeholders', missing });
+    return;
+  }
+
   const result = enqueue({
     project: project.id,
     event,
     recipient: to,
-    payload: payload && typeof payload === 'object' ? payload : {},
+    payload: safePayload as Record<string, string | number>,
     channel,
   });
 
@@ -59,27 +75,88 @@ router.post('/otp/request', (req, res) => {
     return;
   }
 
-  const generated = generateOtp(project, to);
-  if (!generated.ok) {
-    res.status(429).json({ error: generated.reason, retryAfterSeconds: generated.retryAfterSeconds });
-    return;
-  }
-
-  // Past its own validity window the code is worse than no message at all —
-  // the recipient types in a number the server already rejects.
-  const enqueued = enqueue({
-    project: project.id,
-    event: 'otp',
-    recipient: to,
-    payload: { code: generated.code },
-    ttlMinutes: project.otpExpiryMinutes,
-  });
-  if (!enqueued.ok) {
-    res.status(429).json({ error: enqueued.reason });
-    return;
-  }
-  res.status(202).json({ id: enqueued.id, status: 'queued' });
+  // Issuing the code and queueing its message are one step: see inTransaction.
+  // Anything short of both succeeding must leave no trace, or the caller is
+  // told "try later" while holding a code they never received and a cooldown
+  // that blocks the retry.
+  const outcome = issueAndQueue(project, to, 'otp', project.otpExpiryMinutes);
+  respondToIssue(res, outcome);
 });
+
+type IssueOutcome =
+  | { kind: 'queued'; id: number }
+  | { kind: 'already_sent'; retryAfterSeconds: number; expiresInSeconds: number }
+  | { kind: 'rejected'; error: string; retryAfterSeconds?: number };
+
+export function issueAndQueue(
+  project: ProjectConfig,
+  to: string,
+  event: 'otp' | 'password_reset',
+  ttlMinutes: number,
+): IssueOutcome {
+  let rejection: IssueOutcome | null = null;
+
+  const queued = inTransaction<{ id: number }>(() => {
+    const purpose = event === 'otp' ? 'login' : 'password_reset';
+    const generated = generateOtp(project, to, purpose);
+    if (!generated.ok) {
+      rejection =
+        generated.reason === 'already_sent'
+          ? {
+              kind: 'already_sent',
+              retryAfterSeconds: generated.retryAfterSeconds,
+              expiresInSeconds: generated.expiresInSeconds,
+            }
+          : { kind: 'rejected', error: generated.reason, retryAfterSeconds: generated.retryAfterSeconds };
+      return null; // rolls back
+    }
+
+    // Past its own validity window the code is worse than no message at all —
+    // the recipient types in a number the server already rejects.
+    const enqueued = enqueue({
+      project: project.id,
+      event,
+      recipient: to,
+      payload: { code: generated.code },
+      ttlMinutes,
+    });
+    if (!enqueued.ok) {
+      rejection = { kind: 'rejected', error: enqueued.reason };
+      return null; // rolls back the code row AND its daily-quota row
+    }
+    return { id: enqueued.id };
+  });
+
+  if (queued) return { kind: 'queued', id: queued.id };
+  return rejection ?? { kind: 'rejected', error: 'unknown_error' };
+}
+
+function respondToIssue(res: Response, outcome: IssueOutcome): void {
+  if (outcome.kind === 'queued') {
+    res.status(202).json({ id: outcome.id, status: 'queued' });
+    return;
+  }
+  // 202, like a fresh send — because from the caller's point of view the thing
+  // they asked for is true: this customer has a code on the way. Answering 429
+  // here was actively harmful (see generateOtp's `already_sent` branch): a
+  // request that succeeded but timed out at the caller left the site insisting
+  // nothing was sent while the code was arriving.
+  //
+  // Deliberately the SAME status a fresh send returns, so the existing clients
+  // — which treat only 202 as success — do the right thing before they are
+  // updated to read `alreadySent`. It is also less leaky than the old 429,
+  // which told any prober that this number had asked for a code recently.
+  if (outcome.kind === 'already_sent') {
+    res.status(202).json({
+      status: 'already_sent',
+      alreadySent: true,
+      retryAfterSeconds: outcome.retryAfterSeconds,
+      expiresInSeconds: outcome.expiresInSeconds,
+    });
+    return;
+  }
+  res.status(429).json({ error: outcome.error, retryAfterSeconds: outcome.retryAfterSeconds });
+}
 
 router.post('/otp/verify', (req, res) => {
   const project = req.project!;
@@ -107,24 +184,7 @@ router.post('/password-reset/request', (req, res) => {
     return;
   }
 
-  const generated = generateOtp(project, to, 'password_reset');
-  if (!generated.ok) {
-    res.status(429).json({ error: generated.reason, retryAfterSeconds: generated.retryAfterSeconds });
-    return;
-  }
-
-  const enqueued = enqueue({
-    project: project.id,
-    event: 'password_reset',
-    recipient: to,
-    payload: { code: generated.code },
-    ttlMinutes: project.otpExpiryMinutes,
-  });
-  if (!enqueued.ok) {
-    res.status(429).json({ error: enqueued.reason });
-    return;
-  }
-  res.status(202).json({ id: enqueued.id, status: 'queued' });
+  respondToIssue(res, issueAndQueue(project, to, 'password_reset', project.otpExpiryMinutes));
 });
 
 router.post('/password-reset/verify', (req, res) => {
@@ -181,8 +241,15 @@ router.get('/status/:id', (req, res) => {
 
 // Plan 9, point 7: reflects load, not just up/down, so a monitor catches
 // pressure building before anything actually crashes.
+// A queue that stops draining is the only reliable evidence that delivery is
+// broken. Sized well above the worker's own pacing (3-9s per message, batches
+// of 20) plus a reconnect cycle, so ordinary bursts and brief drops don't trip
+// it — but a stall does, within minutes.
+const QUEUE_STALL_SECONDS = 10 * 60;
+
 router.get('/health', (_req, res) => {
   const pending = countPending();
+  const oldestPendingSeconds = oldestPendingAgeSeconds();
   const wa = getConnectionState();
 
   // Named reasons rather than a bare boolean: the monitor polling this turns
@@ -193,6 +260,24 @@ router.get('/health', (_req, res) => {
   else if (!wa.connected) reasons.push('whatsapp_disconnected');
   if (wa.sessionOrigin === 'restored') reasons.push('session_restored_from_backup');
   if (pending > config.queue.maxPending * 0.8) reasons.push('queue_near_capacity');
+  // Capacity alone was never going to catch a stall: at real volume the queue
+  // never gets near 4000 rows, so sends could be failing for hours with
+  // /health still answering `ok`.
+  if (oldestPendingSeconds > QUEUE_STALL_SECONDS) reasons.push('queue_stalled');
+
+  // A restriction WhatsApp announced itself. The most actionable state there
+  // is — it names its own end time, and re-pairing before then is the one
+  // thing that can extend it — so it must reach the monitor, not just a log.
+  const enforcement = activeEnforcement();
+  if (enforcement) reasons.push('account_restricted');
+
+  const rate = checkSendRate(wa.pairedAtMs);
+  if (!rate.allowed) reasons.push('send_rate_ceiling');
+
+  // A paused channel is a live reason nothing is going out, and it was
+  // previously invisible here — the pause state existed but nothing read it.
+  const paused = pausedChannels();
+  if (paused.length > 0) reasons.push('channel_paused');
 
   const degraded = reasons.length > 0 && !(reasons.length === 1 && reasons[0] === 'session_restored_from_backup');
 
@@ -200,6 +285,11 @@ router.get('/health', (_req, res) => {
     status: degraded ? 'degraded' : 'ok',
     reasons,
     whatsapp: wa,
-    queue: { pending, maxPending: config.queue.maxPending },
+    queue: { pending, maxPending: config.queue.maxPending, oldestPendingSeconds },
+    sendRate: { used: rate.used, limit: rate.limit, warmingUp: rate.warmingUp },
+    pausedChannels: paused,
+    enforcement: enforcement
+      ? { type: enforcement.type, endsAt: new Date(enforcement.endsAtMs).toISOString() }
+      : null,
   });
 });
