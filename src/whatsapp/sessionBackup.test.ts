@@ -18,7 +18,7 @@ process.env.DATA_DIR = mkdtempSync(path.join(tmpdir(), 'sms-api-backup-'));
 
 process.env.SESSION_BACKUP_ENCRYPTION_KEY ??= 'test-passphrase-for-backup-roundtrip';
 
-const { snapshotLocal, restoreFromLocal, encryptBundle, decryptBundle, encryptFragments } =
+const { snapshotLocal, restoreFromLocal, encryptBundle, decryptBundle, encryptFragments, quarantineLocal } =
   await import('./sessionBackup.ts');
 const crypto = await import('node:crypto');
 const zlib = await import('node:zlib');
@@ -177,4 +177,42 @@ test('snapshotting leaves no temp file for a later restore to trip over', () => 
     readdirSync(BACKUP_DIR).filter((f) => f.endsWith('.tmp')),
     [],
   );
+});
+
+// A real logout revokes the identity on WhatsApp's own servers, so the local
+// backup is just as dead as the live session — restoring it must stop being
+// possible, or prepareSession() would quietly bring the revoked session back.
+test('quarantining a session moves both the live folder and its backup aside, not deleted', () => {
+  reset();
+  writeSession({ registrationId: 1 }, { 'session-a': { k: 1 } });
+  snapshotLocal();
+  assert.ok(existsSync(AUTH_DIR));
+  assert.ok(existsSync(BACKUP_DIR));
+
+  quarantineLocal('test-suffix');
+
+  assert.ok(!existsSync(AUTH_DIR), 'live folder must no longer be at its expected path');
+  assert.ok(!existsSync(BACKUP_DIR), 'backup must no longer be at its expected path');
+  assert.ok(existsSync(`${AUTH_DIR}.test-suffix`), 'live folder must survive, renamed aside');
+  assert.ok(existsSync(`${BACKUP_DIR}.test-suffix`), 'backup must survive, renamed aside');
+  assert.equal(
+    JSON.parse(readFileSync(path.join(`${AUTH_DIR}.test-suffix`, 'creds.json'), 'utf-8')).registrationId,
+    1,
+    'the quarantined copy must be the real content, not an empty folder',
+  );
+});
+
+test('after quarantining, a restore correctly reports no_backup instead of reviving the dead identity', () => {
+  reset();
+  writeSession({ registrationId: 1 }, { 'session-a': { k: 1 } });
+  snapshotLocal();
+
+  quarantineLocal('test-suffix-2');
+
+  assert.deepEqual(restoreFromLocal(), { ok: false, reason: 'no_backup' });
+});
+
+test('quarantining when there is nothing to quarantine yet does not throw', () => {
+  reset();
+  assert.doesNotThrow(() => quarantineLocal('test-suffix-3'));
 });

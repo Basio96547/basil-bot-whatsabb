@@ -19,9 +19,10 @@ export interface EnqueueInput {
   ttlMinutes?: number; // how long this message is still worth delivering
 }
 
-export type EnqueueResult = { ok: true; id: number } | { ok: false; reason: 'queue_full' };
+export type EnqueueResult = { ok: true; id: number } | { ok: false; reason: 'queue_full' | 'project_queue_full' };
 
 const countPendingStmt = db.prepare(`SELECT COUNT(*) AS n FROM messages WHERE status = 'pending'`);
+const countPendingByProjectStmt = db.prepare(`SELECT COUNT(*) AS n FROM messages WHERE status = 'pending' AND project = ?`);
 const insertStmt = db.prepare(`
   INSERT INTO messages (project, channel, channel_forced, event, recipient, payload, expires_at)
   VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -32,6 +33,14 @@ const insertStmt = db.prepare(`
 export function enqueue(input: EnqueueInput): EnqueueResult {
   const pending = (countPendingStmt.get() as { n: number }).n;
   if (pending >= config.queue.maxPending) return { ok: false, reason: 'queue_full' };
+
+  // The cap above bounds the AGGREGATE queue, shared by every project on this
+  // WhatsApp number. This bounds what any single one of them may occupy in
+  // it, so one project flooding /notify or /otp/request cannot starve the
+  // others' delivery — they were previously free to fill the entire shared
+  // queue on their own.
+  const projectPending = (countPendingByProjectStmt.get(input.project) as { n: number }).n;
+  if (projectPending >= config.queue.maxPendingPerProject) return { ok: false, reason: 'project_queue_full' };
 
   const ttlMinutes = input.ttlMinutes ?? DEFAULT_TTL_MINUTES;
   const result = insertStmt.run(

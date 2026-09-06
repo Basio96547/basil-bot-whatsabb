@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import zlib from 'node:zlib';
 import { readdirSync, readFileSync, mkdirSync, writeFileSync, renameSync, rmSync, existsSync } from 'node:fs';
 import path from 'node:path';
-import { S3Client, PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
+import { S3Client, PutObjectCommand, GetObjectCommand, CopyObjectCommand, DeleteObjectCommand } from '@aws-sdk/client-s3';
 import { config } from '../config.ts';
 
 // Plan 8, layer 6: backup of the Baileys auth-state folder, taken on
@@ -279,6 +279,75 @@ export async function restoreSessionFromR2(): Promise<RestoreResult> {
     const code = (error as { name?: string })?.name;
     if (code === 'NoSuchKey' || code === 'NotFound') return { ok: false, reason: 'no_backup' };
     return { ok: false, reason: 'error', error };
+  }
+}
+
+// ---- confirmed logout: stop both backup layers from resurrecting a dead identity ----
+//
+// A real WhatsApp logout (device unlinked, or a re-pair forced by an
+// enforcement) revokes the identity on WhatsApp's OWN servers — not just the
+// local file. So the local backup and the R2 backup are just as dead as the
+// live session: nothing about either COPY changes when the original is
+// revoked. Left in place, prepareSession() in client.ts would restore one of
+// them the next time the process starts (a missing/corrupt creds.json is
+// exactly what it treats as "restore me"), silently bringing the same revoked
+// session back — a human "scanning a new QR" would just watch it fail the
+// same way again, with no obvious reason why.
+//
+// Quarantined, not deleted: this runs off a single disconnect status code, and
+// if that code is ever misreported, the operator can still recover the
+// renamed/copied files by hand. Deleting outright would make that mistake
+// unrecoverable.
+
+function timestampSuffix(): string {
+  return new Date().toISOString().replace(/[:.]/g, '-');
+}
+
+// Exported for testing: the network-free half of quarantineDeadSession, and
+// the half that alone already guarantees the next boot shows a fresh QR
+// (restoreSessionFromR2 only ever runs after both local checks miss).
+export function quarantineLocal(suffix: string): void {
+  for (const dir of [AUTH_DIR, LOCAL_BACKUP_DIR, `${LOCAL_BACKUP_DIR}.old`]) {
+    if (existsSync(dir)) renameSync(dir, `${dir}.${suffix}`);
+  }
+}
+
+async function quarantineR2(suffix: string): Promise<void> {
+  const bucket = config.sessionBackup.r2Bucket;
+  await getS3().send(
+    new CopyObjectCommand({ Bucket: bucket, CopySource: `/${bucket}/${BACKUP_KEY}`, Key: `whatsapp-session.loggedout-${suffix}.enc` }),
+  );
+  await getS3().send(new DeleteObjectCommand({ Bucket: bucket, Key: BACKUP_KEY }));
+}
+
+/**
+ * Called once, from the `loggedOut` branch in client.ts. Renames the local
+ * session and its local backup aside, and (best-effort) moves the R2 object
+ * off its well-known key, so the NEXT connection attempt — whenever the
+ * operator makes one — starts from a genuinely empty identity and shows a
+ * fresh QR, instead of prepareSession() quietly restoring the one WhatsApp
+ * just revoked.
+ *
+ * Does not itself reconnect or delete anything irreversibly — see the header
+ * comment above.
+ */
+export async function quarantineDeadSession(logger: {
+  info: (msg: string) => void;
+  error: (msg: string, err: unknown) => void;
+}): Promise<void> {
+  const suffix = `loggedout-${timestampSuffix()}`;
+  quarantineLocal(suffix);
+  logger.info('[session-backup] عُزلت الجلسة المحلية ونسختها الاحتياطية بعد تسجيل خروج فعلي — الاتصال التالي يبدأ بهوية فارغة');
+
+  if (!config.sessionBackup.enabled) return;
+  try {
+    await quarantineR2(suffix);
+    logger.info('[session-backup] عُزلت نسخة R2 أيضاً');
+  } catch (err) {
+    // Best-effort: the local quarantine above is already enough for the next
+    // boot to show a fresh QR, since restoreSessionFromR2 only runs when the
+    // local checks (now both moved aside) find nothing.
+    logger.error('[session-backup] تعذّر عزل نسخة R2 — ستبقى الجلسة الميتة قابلة للاستعادة منها لو فشلت الاستعادة المحلية لسبب آخر', err);
   }
 }
 

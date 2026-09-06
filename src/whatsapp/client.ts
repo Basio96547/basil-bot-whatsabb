@@ -7,7 +7,7 @@ import makeWASocket, {
 import qrcodeTerminal from 'qrcode-terminal';
 import pino from 'pino';
 import { config } from '../config.ts';
-import { scheduleSessionBackup, restoreSessionFromR2, restoreFromLocal } from './sessionBackup.ts';
+import { scheduleSessionBackup, restoreSessionFromR2, restoreFromLocal, quarantineDeadSession } from './sessionBackup.ts';
 import { probeCreds, useAtomicMultiFileAuthState } from './authState.ts';
 import { notifyWork } from '../queue/wakeup.ts';
 import { rememberPairing, checkSendRate } from '../queue/sendRate.ts';
@@ -339,6 +339,12 @@ export async function connectWhatsApp(): Promise<void> {
         // Plan 8, layer 1: the one case that needs a human — new QR required.
         state.needsReauth = true;
         app.error('[whatsapp] تسجيل خروج فعلي — يحتاج مسح QR جديد. راقب /health.');
+        // The identity is revoked on WhatsApp's own servers, so the local and
+        // R2 backups are just as dead as this session — left alone, either
+        // one would be auto-restored on the next connect attempt and repeat
+        // this exact failure with no visible reason why. No reconnect is
+        // scheduled here: that stays a human decision, same as before.
+        void quarantineDeadSession(app).catch((err) => app.error('[whatsapp] فشل عزل الجلسة الميتة', err));
         return;
       }
 

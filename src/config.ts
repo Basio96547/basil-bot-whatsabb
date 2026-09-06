@@ -139,6 +139,13 @@ export const config = {
 
   queue: {
     maxPending: Number(process.env.QUEUE_MAX_PENDING ?? 5000),
+    // Plan 9 point 2 bounded the AGGREGATE queue, shared by every project on
+    // this one WhatsApp number, but nothing bounded what ONE of them could
+    // occupy inside it — a leaked or misbehaving API key for a single project
+    // could fill the shared queue and starve OTP delivery for every other
+    // tenant. Default well below the aggregate cap so no single project can
+    // come close to dominating it, while staying far above real traffic.
+    maxPendingPerProject: Number(process.env.QUEUE_MAX_PENDING_PER_PROJECT ?? 1000),
     sendBatchSize: Number(process.env.SEND_BATCH_SIZE ?? 20),
     sendMinDelayMs: Number(process.env.SEND_MIN_DELAY_MS ?? 3000),
     sendMaxDelayMs: Number(process.env.SEND_MAX_DELAY_MS ?? 9000),
