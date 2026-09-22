@@ -60,6 +60,16 @@ function placeholdersIn(text: string): string[] {
 // even when no default variant of that event happens to.
 const AMBIENT_PLACEHOLDERS = ['brand', 'expiryMinutes'];
 
+// `name in data` is true even when data[name] is explicitly `null` — and a
+// nullable DB column serialized straight into a /notify payload (a normal
+// shape for most ORMs) is exactly that. Without this, `{ amount: null }`
+// passed every "is it present" check and then `String(null)` put the literal
+// text "null" into a real customer's message — the same defect class this
+// module exists to prevent, just triggered by null instead of a missing key.
+function hasValue(data: Record<string, unknown>, name: string): boolean {
+  return data[name] !== undefined && data[name] !== null;
+}
+
 // Checked once at boot (config.ts) rather than at send time — a typo'd
 // placeholder would otherwise ship silently and reach a customer as the
 // literal text "{cod}" inside their verification message.
@@ -110,7 +120,7 @@ export function missingPlaceholders(
 
   const missingPerVariant = variants.map((variant) =>
     placeholdersIn(variant).filter(
-      (name) => !AMBIENT_PLACEHOLDERS.includes(name) && !(name in payload),
+      (name) => !AMBIENT_PLACEHOLDERS.includes(name) && !hasValue(payload, name),
     ),
   );
 
@@ -139,7 +149,7 @@ export function renderTemplate(
   // happened to use it, so the same call site failed intermittently.
   const eligible = variants
     .map((text, index) => ({ text, index }))
-    .filter(({ text }) => placeholdersIn(text).every((name) => name in data));
+    .filter(({ text }) => placeholdersIn(text).every((name) => hasValue(data, name)));
 
   if (eligible.length === 0) {
     throw new Error(
@@ -149,7 +159,7 @@ export function renderTemplate(
 
   const chosen = eligible[crypto.randomInt(0, eligible.length)];
   const text = chosen.text.replace(/\{(\w+)\}/g, (match, key) =>
-    key in data ? String(data[key]) : match,
+    hasValue(data, key) ? String(data[key]) : match,
   );
   return { text, variantIndex: chosen.index };
 }

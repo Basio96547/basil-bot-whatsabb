@@ -1,6 +1,17 @@
 import crypto from 'node:crypto';
 import zlib from 'node:zlib';
-import { readdirSync, readFileSync, mkdirSync, writeFileSync, renameSync, rmSync, existsSync } from 'node:fs';
+import {
+  readdirSync,
+  readFileSync,
+  mkdirSync,
+  renameSync,
+  rmSync,
+  existsSync,
+  openSync,
+  writeSync,
+  fsyncSync,
+  closeSync,
+} from 'node:fs';
 import path from 'node:path';
 import { S3Client, PutObjectCommand, GetObjectCommand, CopyObjectCommand, DeleteObjectCommand } from '@aws-sdk/client-s3';
 import { config } from '../config.ts';
@@ -152,10 +163,68 @@ async function runBackup(): Promise<void> {
 
 // ---- layer 1: local copy (no credentials, always on) ----
 
+// Mirrors authState.ts's writeAtomic's DATA half — same rationale, sync
+// instead of async since every caller here is already synchronous. Before
+// this, the rename could land before the data did: exactly the crash this
+// file's whole staging-dir rework (snapshotLocal) was written to survive,
+// undermined by the one atomic-write primitive that hadn't received the same
+// hardening.
+//
+// Deliberately does NOT also fsync the containing directory on every call —
+// unlike authState.ts's per-key writes (naturally spread over time as
+// messages arrive), the callers below write a live session's ~7500 files in
+// one tight burst. Fsyncing the directory after each one is ~7500 blocking
+// syscalls on the same process that also serves OTP requests, for a
+// guarantee that only needs to hold once the WHOLE burst is done. Callers
+// call fsyncDir() themselves, once, after their loop.
 function writeFileAtomic(filePath: string, contents: string): void {
   const tmpPath = `${filePath}.tmp`;
-  writeFileSync(tmpPath, contents, 'utf-8');
+  const fd = openSync(tmpPath, 'w');
+  try {
+    writeSync(fd, contents, null, 'utf-8');
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
   renameSync(tmpPath, filePath);
+}
+
+// Flushes a directory's own entries (which file names now exist / point
+// where) — durability for the renames above across a power cut needs this
+// too, or the directory could still say "nothing here" (or the old name)
+// even though every file's data already landed. Called ONCE per batch of
+// writeFileAtomic calls into the same directory, not per file — see
+// writeFileAtomic's own comment for why.
+function fsyncDir(dirPath: string): void {
+  // Best-effort: some platforms (Windows in particular) refuse to open a
+  // directory for fsync, and there the writes are still no worse than before.
+  try {
+    const dirFd = openSync(dirPath, 'r');
+    try {
+      fsyncSync(dirFd);
+    } finally {
+      closeSync(dirFd);
+    }
+  } catch {
+    /* directory fsync unsupported here — nothing further to do */
+  }
+}
+
+// Removes any live .json file NOT in `keep` — shared by both restore paths so
+// neither can leave a hybrid of an older identity's leftover keys mixed with
+// a newly-restored one. Copying a backup/bundle *over* the live folder without
+// this kept every key the source didn't contain, producing a session that
+// authenticates and then fails to decrypt (see restoreFromLocal's history —
+// this exact bug, fixed there and not, until now, on the R2 restore path).
+// Exported for testing: a pure filesystem operation, and the one both restore
+// paths below rely on to avoid that bug.
+export function clearStaleAuthFiles(keep: Set<string>): void {
+  if (!existsSync(AUTH_DIR)) return;
+  for (const name of readdirSync(AUTH_DIR)) {
+    if (name.endsWith('.json') && !keep.has(name)) {
+      rmSync(path.join(AUTH_DIR, name), { force: true });
+    }
+  }
 }
 
 export function snapshotLocal(): number {
@@ -190,6 +259,7 @@ export function snapshotLocal(): number {
     }
     writeFileAtomic(path.join(staging, name), contents);
   }
+  fsyncDir(staging); // one flush for the whole batch, not one per file
 
   // creds.json is what makes a snapshot usable at all; without it the staging
   // copy is worthless and must not replace a good backup.
@@ -222,21 +292,15 @@ export function restoreFromLocal(): { ok: true; files: number } | { ok: false; r
     mkdirSync(AUTH_DIR, { recursive: true });
     const files = readdirSync(LOCAL_BACKUP_DIR).filter((name) => name.endsWith('.json'));
 
-    // Stale keys in the live folder are removed, not left in place. Copying the
-    // backup *over* the live folder kept every key the backup didn't contain,
-    // producing a hybrid of an older identity and newer session keys that no
-    // snapshot ever produced — it can connect and then fail to decrypt.
-    // snapshotLocal clears its own target for exactly this reason.
-    const restored = new Set(files);
-    for (const name of readdirSync(AUTH_DIR)) {
-      if (name.endsWith('.json') && !restored.has(name)) {
-        rmSync(path.join(AUTH_DIR, name), { force: true });
-      }
-    }
+    // Stale keys in the live folder are removed, not left in place — see
+    // clearStaleAuthFiles's own comment for the hybrid-identity bug this
+    // avoids. snapshotLocal clears its own target for the same reason.
+    clearStaleAuthFiles(new Set(files));
 
     for (const name of files) {
       writeFileAtomic(path.join(AUTH_DIR, name), readFileSync(path.join(LOCAL_BACKUP_DIR, name), 'utf-8'));
     }
+    fsyncDir(AUTH_DIR); // one flush for the whole batch, not one per file
     return { ok: true, files: files.length };
   } catch (error) {
     return { ok: false, reason: 'error', error };
@@ -269,12 +333,20 @@ export async function restoreSessionFromR2(): Promise<RestoreResult> {
     // SESSION_BACKUP_ENCRYPTION_KEY or a truncated object must fail here,
     // with the existing (possibly still usable) files left untouched.
     const bundle = JSON.parse(decryptBundle(Buffer.concat(chunks))) as Record<string, string>;
+    const filenames = Object.keys(bundle);
 
     mkdirSync(AUTH_DIR, { recursive: true });
+    // Same guard restoreFromLocal already applies: without it, a live folder
+    // left with stale keys from a corrupt/interrupted session (this is the
+    // LAST-RESORT path, only reached once the local restore has already
+    // failed) mixes with the R2 identity into a hybrid that connects and then
+    // fails to decrypt.
+    clearStaleAuthFiles(new Set(filenames));
     for (const [filename, contents] of Object.entries(bundle)) {
-      writeFileSync(path.join(AUTH_DIR, filename), contents, 'utf-8');
+      writeFileAtomic(path.join(AUTH_DIR, filename), contents);
     }
-    return { ok: true, files: Object.keys(bundle).length };
+    fsyncDir(AUTH_DIR); // one flush for the whole batch, not one per file
+    return { ok: true, files: filenames.length };
   } catch (error) {
     const code = (error as { name?: string })?.name;
     if (code === 'NoSuchKey' || code === 'NotFound') return { ok: false, reason: 'no_backup' };
@@ -328,27 +400,48 @@ async function quarantineR2(suffix: string): Promise<void> {
  * fresh QR, instead of prepareSession() quietly restoring the one WhatsApp
  * just revoked.
  *
+ * R2 is quarantined FIRST, deliberately, even though it is the slower half
+ * (network round-trips) and the local rename is a single near-instant
+ * syscall. restoreSessionFromR2() only ever runs once BOTH local checks
+ * miss (see prepareSession() in client.ts) — so as long as the live local
+ * folder is still in place, a process restart mid-R2-quarantine just means
+ * this same handler fires again on the next reconnect attempt (the identity
+ * is dead either way, so retrying is free) instead of leaving the R2 object
+ * live under its well-known key while the local copy has ALREADY vanished,
+ * which is exactly the window in which restoreSessionFromR2() would
+ * resurrect the very session WhatsApp just revoked.
+ *
+ * `deps` is overridable only from tests — quarantineR2 needs real R2
+ * credentials and network access that a unit test has neither of.
+ *
  * Does not itself reconnect or delete anything irreversibly — see the header
  * comment above.
  */
-export async function quarantineDeadSession(logger: {
-  info: (msg: string) => void;
-  error: (msg: string, err: unknown) => void;
-}): Promise<void> {
+export async function quarantineDeadSession(
+  logger: { info: (msg: string) => void; error: (msg: string, err: unknown) => void },
+  deps: { quarantineLocal?: (suffix: string) => void; quarantineR2?: (suffix: string) => Promise<void> } = {},
+): Promise<void> {
+  const doLocal = deps.quarantineLocal ?? quarantineLocal;
+  const doR2 = deps.quarantineR2 ?? quarantineR2;
   const suffix = `loggedout-${timestampSuffix()}`;
-  quarantineLocal(suffix);
-  logger.info('[session-backup] عُزلت الجلسة المحلية ونسختها الاحتياطية بعد تسجيل خروج فعلي — الاتصال التالي يبدأ بهوية فارغة');
 
-  if (!config.sessionBackup.enabled) return;
-  try {
-    await quarantineR2(suffix);
-    logger.info('[session-backup] عُزلت نسخة R2 أيضاً');
-  } catch (err) {
-    // Best-effort: the local quarantine above is already enough for the next
-    // boot to show a fresh QR, since restoreSessionFromR2 only runs when the
-    // local checks (now both moved aside) find nothing.
-    logger.error('[session-backup] تعذّر عزل نسخة R2 — ستبقى الجلسة الميتة قابلة للاستعادة منها لو فشلت الاستعادة المحلية لسبب آخر', err);
+  if (config.sessionBackup.enabled) {
+    try {
+      await doR2(suffix);
+      logger.info('[session-backup] عُزلت نسخة R2');
+    } catch (err) {
+      // Best-effort: the local quarantine below still runs regardless, and a
+      // permanently failed R2 quarantine (as opposed to a crash mid-attempt)
+      // was already only ever best-effort — see the module header.
+      logger.error(
+        '[session-backup] تعذّر عزل نسخة R2 — ستبقى الجلسة الميتة قابلة للاستعادة منها لو فشلت الاستعادة المحلية لسبب آخر',
+        err,
+      );
+    }
   }
+
+  doLocal(suffix);
+  logger.info('[session-backup] عُزلت الجلسة المحلية ونسختها الاحتياطية بعد تسجيل خروج فعلي — الاتصال التالي يبدأ بهوية فارغة');
 }
 
 let debounceTimer: ReturnType<typeof setTimeout> | null = null;

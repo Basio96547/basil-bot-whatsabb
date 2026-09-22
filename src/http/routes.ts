@@ -1,6 +1,6 @@
 import { Router, type Response } from 'express';
 import { enqueue, getStatus, countPending, oldestPendingAgeSeconds } from '../queue/queue.ts';
-import { generateOtp, verifyOtp } from '../otp/otp.ts';
+import { generateOtp, verifyOtp, linkOtpMessage } from '../otp/otp.ts';
 import { issueResetToken, validateResetToken } from '../passwordReset/passwordReset.ts';
 import { getConnectionState } from '../whatsapp/client.ts';
 import { knownEvents, missingPlaceholders } from '../templates/templates.ts';
@@ -124,6 +124,10 @@ export function issueAndQueue(
       rejection = { kind: 'rejected', error: enqueued.reason };
       return null; // rolls back the code row AND its daily-quota row
     }
+    // So a later repeat request can tell "the message that would deliver this
+    // code already failed" apart from "assume it's fine" — see the
+    // already_sent branch in generateOtp.
+    linkOtpMessage(generated.otpId, enqueued.id);
     return { id: enqueued.id };
   });
 

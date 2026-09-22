@@ -8,7 +8,7 @@ import qrcodeTerminal from 'qrcode-terminal';
 import pino from 'pino';
 import { config } from '../config.ts';
 import { scheduleSessionBackup, restoreSessionFromR2, restoreFromLocal, quarantineDeadSession } from './sessionBackup.ts';
-import { probeCreds, useAtomicMultiFileAuthState } from './authState.ts';
+import { probeCreds, useAtomicMultiFileAuthState, type CredsProbe } from './authState.ts';
 import { notifyWork } from '../queue/wakeup.ts';
 import { rememberPairing, checkSendRate } from '../queue/sendRate.ts';
 import { parseEnforcement, recordEnforcement, activeEnforcement, type Enforcement } from './enforcement.ts';
@@ -137,20 +137,27 @@ function scheduleReconnect(): void {
 // identity, the old WhatsApp link would be dead, and nothing anywhere would
 // say so. Now the backup is tried first, and whatever happened is recorded on
 // `state` so /health (and the monitor polling it) can report it.
-async function prepareSession(): Promise<void> {
+// Returns the probe so the caller can decide whether it is even safe to load
+// (or generate) an auth state afterward — see connectWhatsApp's use of it.
+export async function prepareSession(): Promise<CredsProbe> {
   const probe = await probeCreds(authDir);
   // Nothing to repair — leave whatever the last connect concluded in place;
   // only a successful 'open' below clears a previous warning.
-  if (probe === 'ok') return;
+  if (probe === 'ok') return probe;
 
   // The file exists but could not be read right now (permissions, too many
   // open handles, the OS busy). Restoring here would overwrite a session that
   // is probably fine with an older snapshot — strictly worse than waiting for
-  // the reconnect backoff to try again.
+  // the reconnect backoff to try again. The caller must also not proceed to
+  // load an auth state on this same attempt: useAtomicMultiFileAuthState's own
+  // creds read would hit this identical transient error and silently fall
+  // back to a blank identity, which the next creds.update then saves over the
+  // real session — the exact loss this probe exists to prevent, one function
+  // away.
   if (probe === 'unreadable') {
     state.sessionNote = 'تعذّر قراءة ملف الجلسة مؤقتاً — لن تُستعاد نسخة فوق جلسة قد تكون سليمة';
     app.error(`[whatsapp] ${state.sessionNote}`);
-    return;
+    return probe;
   }
 
   const problem = probe === 'corrupt' ? 'ملف الجلسة تالف' : 'لا توجد جلسة محلية';
@@ -163,7 +170,7 @@ async function prepareSession(): Promise<void> {
     state.sessionOrigin = 'restored';
     state.sessionNote = `${problem} — استُعيدت ${local.files} ملف من النسخة المحلية`;
     app.info(`[whatsapp] ${state.sessionNote}`);
-    return;
+    return probe;
   }
 
   const restore = await restoreSessionFromR2();
@@ -171,7 +178,7 @@ async function prepareSession(): Promise<void> {
     state.sessionOrigin = 'restored';
     state.sessionNote = `${problem} — استُعيدت ${restore.files} ملف من نسخة R2`;
     app.info(`[whatsapp] ${state.sessionNote}`);
-    return;
+    return probe;
   }
 
   state.sessionNote =
@@ -179,6 +186,7 @@ async function prepareSession(): Promise<void> {
       ? `${problem}، ولا نسخة محلية، ونسخ R2 غير مُفعَّل`
       : `${problem}، ولا نسخة محلية، وتعذّرت الاستعادة من R2 (${restore.reason})`;
   app.error(`[whatsapp] ${state.sessionNote}`, restore.error);
+  return probe;
 }
 
 // Boot entry point. Deliberately not awaited by the caller (see index.ts) and
@@ -192,7 +200,14 @@ export function startWhatsApp(): void {
 }
 
 export async function connectWhatsApp(): Promise<void> {
-  await prepareSession();
+  const probe = await prepareSession();
+  if (probe === 'unreadable') {
+    // Do not let useAtomicMultiFileAuthState's own creds read hit this exact
+    // transient error independently — see prepareSession's comment. Throwing
+    // here routes through the same retry-with-backoff every other transient
+    // connect failure already uses (see startWhatsApp / scheduleReconnect).
+    throw new Error('creds.json تعذّرت قراءته مؤقتاً — إعادة المحاولة لاحقاً بدل بناء حالة مصادقة عليه الآن');
+  }
   const { state: authState, saveCreds } = await useAtomicMultiFileAuthState(authDir);
 
   // The authoritative check, and the reason prepareSession doesn't have to be

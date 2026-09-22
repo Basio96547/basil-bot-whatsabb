@@ -17,9 +17,23 @@ import path from 'node:path';
 process.env.DATA_DIR = mkdtempSync(path.join(tmpdir(), 'sms-api-backup-'));
 
 process.env.SESSION_BACKUP_ENCRYPTION_KEY ??= 'test-passphrase-for-backup-roundtrip';
+// Fake but well-formed — makes config.sessionBackup.enabled true so
+// quarantineDeadSession's R2 branch is exercised below, using injected
+// stand-ins rather than a real S3Client, which none of these tests have.
+process.env.R2_ACCOUNT_ID ??= 'test-account';
+process.env.R2_ACCESS_KEY_ID ??= 'test-access-key';
+process.env.R2_SECRET_ACCESS_KEY ??= 'test-secret';
 
-const { snapshotLocal, restoreFromLocal, encryptBundle, decryptBundle, encryptFragments, quarantineLocal } =
-  await import('./sessionBackup.ts');
+const {
+  snapshotLocal,
+  restoreFromLocal,
+  encryptBundle,
+  decryptBundle,
+  encryptFragments,
+  quarantineLocal,
+  quarantineDeadSession,
+  clearStaleAuthFiles,
+} = await import('./sessionBackup.ts');
 const crypto = await import('node:crypto');
 const zlib = await import('node:zlib');
 
@@ -215,4 +229,60 @@ test('after quarantining, a restore correctly reports no_backup instead of reviv
 test('quarantining when there is nothing to quarantine yet does not throw', () => {
   reset();
   assert.doesNotThrow(() => quarantineLocal('test-suffix-3'));
+});
+
+// clearStaleAuthFiles is the guard restoreFromLocal AND restoreSessionFromR2
+// both now share — restoreSessionFromR2 needs real R2 to exercise end to end,
+// but the guard itself is a pure filesystem operation and is tested directly.
+test('clearStaleAuthFiles removes any live key not in the given set, leaving the rest untouched', () => {
+  reset();
+  writeSession({ registrationId: 1 }, { 'session-old': { k: 1 }, 'session-keep': { k: 2 } });
+
+  clearStaleAuthFiles(new Set(['creds.json', 'session-keep.json']));
+
+  const live = readdirSync(AUTH_DIR).filter((n) => n.endsWith('.json')).sort();
+  assert.deepEqual(live, ['creds.json', 'session-keep.json']);
+});
+
+test('clearStaleAuthFiles does nothing, and does not throw, when the live folder does not exist yet', () => {
+  rmSync(AUTH_DIR, { recursive: true, force: true });
+  assert.doesNotThrow(() => clearStaleAuthFiles(new Set(['creds.json'])));
+});
+
+// The restart race this pins: quarantineDeadSession used to rename the local
+// session aside FIRST (fast, near-instant) and only then quarantine R2
+// (slow, network round-trips) — so a process restart in between left R2's
+// well-known key still live while the local copy was already gone, and
+// restoreSessionFromR2 would resurrect the very identity WhatsApp just
+// revoked. R2 must now be quarantined first.
+test('quarantineDeadSession quarantines R2 BEFORE the local rename', async () => {
+  const calls: string[] = [];
+  await quarantineDeadSession(
+    { info: () => {}, error: () => {} },
+    {
+      quarantineR2: async () => {
+        calls.push('r2');
+      },
+      quarantineLocal: () => {
+        calls.push('local');
+      },
+    },
+  );
+  assert.deepEqual(calls, ['r2', 'local'], 'R2 must finish before the fast local rename removes the last local trace');
+});
+
+test('a failing R2 quarantine does not stop the local quarantine from still happening', async () => {
+  const calls: string[] = [];
+  await quarantineDeadSession(
+    { info: () => {}, error: () => {} },
+    {
+      quarantineR2: async () => {
+        throw new Error('network down');
+      },
+      quarantineLocal: () => {
+        calls.push('local');
+      },
+    },
+  );
+  assert.deepEqual(calls, ['local'], 'a dead identity must still be quarantined locally even if R2 could not be reached');
 });

@@ -7,7 +7,7 @@ import { renderTemplate } from '../templates/templates.ts';
 import { isPaused, recordSuccess, recordFailure } from './circuitBreaker.ts';
 import { sleepUnlessWoken } from './wakeup.ts';
 import { checkSendRate } from './sendRate.ts';
-import { activeEnforcement } from '../whatsapp/enforcement.ts';
+import { activeEnforcement, type Enforcement } from '../whatsapp/enforcement.ts';
 
 const MAX_SEND_ATTEMPTS = 5;
 const SEND_TIMEOUT_MS = 15_000; // plan 9, point 5
@@ -52,6 +52,24 @@ function describeError(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+// Overridable only from tests: getConnectionState()'s `connected`/`pairedAtMs`
+// only ever become true/non-null via a real Baileys `connection.update`
+// event, so exercising the whatsapp-blocked branches in processMessage below
+// without a live socket needs a seam. Production code never passes this.
+export interface WhatsAppGateDeps {
+  isConnected: () => boolean;
+  pairedAtMs: () => number | null;
+  activeEnforcement: () => Enforcement | null;
+  checkSendRate: (pairedAtMs: number | null) => { allowed: boolean };
+}
+
+export const defaultGateDeps: WhatsAppGateDeps = {
+  isConnected: () => getConnectionState().connected,
+  pairedAtMs: () => getConnectionState().pairedAtMs,
+  activeEnforcement,
+  checkSendRate,
+};
+
 /**
  * ترجع `true` إذا خرجت محاولة إرسال فعلية إلى الشبكة، و`false` إذا انتهت
  * الرسالة بقرار محلي (مشروع مجهول، انتهت صلاحيتها، القناة موقوفة، واتساب
@@ -59,7 +77,7 @@ function describeError(err: unknown): string {
  * مقابل إرسال حقيقي — كانت تُدفع حتى للصفوف المتخطّاة، فتقضي الحلقة دقيقتين
  * في المؤقّتات لكل دفعة أثناء أي انقطاع دون أن تُرسل حرفاً واحداً.
  */
-async function processMessage(msg: MessageRow): Promise<boolean> {
+export async function processMessage(msg: MessageRow, gateDeps: WhatsAppGateDeps = defaultGateDeps): Promise<boolean> {
   const project = getProjectById(msg.project);
   if (!project) {
     markFailedPermanently(msg.id, 'unknown_project');
@@ -89,31 +107,58 @@ async function processMessage(msg: MessageRow): Promise<boolean> {
     return false;
   }
 
-  // WhatsApp is known to be down — an outage, or a session sitting on an
-  // unscanned QR. Attempting the send would block for the full 15s timeout
-  // AND consume one of the message's 5 attempts; a long enough outage used to
-  // walk the oldest queued messages all the way to permanently-failed without
-  // a single one ever reaching the network. Leave them pending instead.
-  if (channel === 'whatsapp' && !getConnectionState().connected) {
-    if (!forcedChannel && config.sms.enabled && !isPaused('sms')) {
-      channel = 'sms';
-    } else {
-      return false;
+  // WhatsApp is unavailable for sending right now — down, under an active
+  // restriction WhatsApp itself announced, or over this account's own hourly
+  // send ceiling. Checked per message, right before the attempt: the previous
+  // shape checked enforcement/rate once per BATCH (up to sendBatchSize
+  // messages) at the top of the outer loop, so a restriction or ceiling
+  // crossed mid-batch still let the rest of that batch go out — directly
+  // against the point of either mechanism. Attempting the send anyway would
+  // also block for the full 15s timeout AND consume one of the message's 5
+  // attempts; a long enough outage used to walk the oldest queued messages
+  // all the way to permanently-failed without a single one ever reaching the
+  // network. Leave them pending instead.
+  if (channel === 'whatsapp') {
+    const whatsappBlocked =
+      !gateDeps.isConnected() ||
+      gateDeps.activeEnforcement() !== null ||
+      !gateDeps.checkSendRate(gateDeps.pairedAtMs()).allowed;
+    if (whatsappBlocked) {
+      if (!forcedChannel && config.sms.enabled && !isPaused('sms')) {
+        channel = 'sms';
+      } else {
+        return false;
+      }
     }
   }
 
   if (isPaused(channel)) return false; // plan 9, point 6 — leave pending, retry next tick
 
   const payload = JSON.parse(msg.payload) as Record<string, string | number>;
-  const { text, variantIndex } = renderTemplate(
-    msg.event,
-    {
-      ...payload,
-      brand: project.brandName,
-      expiryMinutes: project.otpExpiryMinutes,
-    },
-    project.templates, // per-project wording; falls back per-event to the shared defaults
-  );
+  let text: string;
+  let variantIndex: number;
+  try {
+    ({ text, variantIndex } = renderTemplate(
+      msg.event,
+      {
+        ...payload,
+        brand: project.brandName,
+        expiryMinutes: project.otpExpiryMinutes,
+      },
+      project.templates, // per-project wording; falls back per-event to the shared defaults
+    ));
+  } catch (err) {
+    // A payload that reaches here without any variant fully satisfiable is a
+    // data/config problem (a payload missing a field, or an override with a
+    // placeholder /notify's own check doesn't agree with), not a transient
+    // one — retrying it changes nothing. Before this guard the throw reached
+    // the loop's outer catch below, which only logs: the row's status and
+    // attempts never changed, so getPendingBatch (oldest first) re-selected
+    // and re-threw on the exact same row on every single tick, forever —
+    // occupying a queue slot with a message that could never succeed or fail.
+    markFailedPermanently(msg.id, `template_render_failed: ${describeError(err)}`);
+    return false;
+  }
 
   let success = false;
   let lastError: string | undefined;
@@ -175,30 +220,30 @@ async function loop(): Promise<void> {
       continue;
     }
 
-    // An active restriction from WhatsApp itself outranks everything: sending
-    // into it cannot succeed and can only make the enforcement worse. Nothing
-    // leaves until the window WhatsApp gave us has passed.
+    // An active restriction from WhatsApp itself, and this account's own
+    // hourly send ceiling, both outrank everything for a WHATSAPP send — but
+    // are checked per message inside processMessage() now, not once here for
+    // the whole batch. A blanket check here (the previous shape) meant a
+    // restriction or ceiling crossed mid-batch still let the rest of an
+    // already-fetched batch of up to sendBatchSize messages go out, and it
+    // blocked fetching the batch AT ALL — including SMS-bound messages, which
+    // carry no WhatsApp ban risk and have nothing to do with either check.
+    //
+    // The two checks below are PURELY informational — logging only, never a
+    // `continue` — so operators still see why WhatsApp sends are stalled
+    // without that visibility doubling as the (buggy) gate again.
     const enforcement = activeEnforcement();
     if (enforcement) {
       console.warn(
-        `[worker] حساب واتساب مقيَّد (${enforcement.type}) حتى ${new Date(enforcement.endsAtMs).toISOString()} — لا إرسال`,
+        `[worker] حساب واتساب مقيَّد (${enforcement.type}) حتى ${new Date(enforcement.endsAtMs).toISOString()} — الإرسال عبر واتساب متوقف، وSMS غير متأثر`,
       );
-      await backOff();
-      continue;
-    }
-
-    // Global ceiling on what the SENDING ACCOUNT emits, checked before the
-    // batch is even read. Per-number caps bound one recipient; this bounds the
-    // aggregate volume, which is the dimension that gets a number restricted.
-    // Over the limit the queue simply stops draining — messages keep their
-    // place and their own TTL decides whether they are still worth sending.
-    const rate = checkSendRate(getConnectionState().pairedAtMs);
-    if (!rate.allowed) {
-      console.warn(
-        `[worker] بلغ سقف الإرسال (${rate.used}/${rate.limit} في الساعة${rate.warmingUp ? '، رقم حديث الربط' : ''}) — إيقاف مؤقت`,
-      );
-      await backOff();
-      continue;
+    } else {
+      const rate = checkSendRate(getConnectionState().pairedAtMs);
+      if (!rate.allowed) {
+        console.warn(
+          `[worker] بلغ سقف الإرسال (${rate.used}/${rate.limit} في الساعة${rate.warmingUp ? '، رقم حديث الربط' : ''}) — واتساب متوقف مؤقتاً، وSMS غير متأثر`,
+        );
+      }
     }
 
     const batch = getPendingBatch(config.queue.sendBatchSize); // plan 9, point 3

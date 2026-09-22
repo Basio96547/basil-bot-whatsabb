@@ -112,6 +112,65 @@ test('a spent code falls back to a plain cooldown, not already_sent', () => {
   assert.equal(outcome.kind === 'rejected' && outcome.error, 'cooldown');
 });
 
+test('a repeat request gets a FRESH code when the original message already failed permanently, instead of promising one that is never coming', () => {
+  clear();
+  assert.equal(issue('963900001020'), 'queued');
+
+  // Simulate the queued message failing permanently before the cooldown ends
+  // (no_channel_available, five exhausted attempts, a template render
+  // failure...) — generateOtp's already_sent branch used to have no way to
+  // know this and would keep telling the customer "check WhatsApp, it's on
+  // its way" for the whole cooldown window.
+  db.exec("UPDATE messages SET status = 'failed'");
+
+  const before = counts();
+  const outcome = issueAndQueue(store, '963900001020', 'otp', store.otpExpiryMinutes);
+  assert.equal(outcome.kind, 'queued', 'الرمز السابق لن يصل أبداً، فيجب إصدار رمز جديد فوراً لا انتظار العميل');
+
+  const after = counts();
+  assert.equal(after.codes, before.codes + 1, 'رمز جديد فعلاً، لا إعادة تدوير القديم');
+  assert.equal(after.sendLog, before.sendLog + 1);
+  assert.equal(after.messages, before.messages + 1);
+});
+
+test('a repeat request also gets a fresh code when the original message is stuck pending too long — a WhatsApp outage, not a permanent failure, never marks it "failed"', () => {
+  clear();
+  assert.equal(issue('963900001022'), 'queued');
+
+  // The message never fails during an outage — it just sits 'pending' for as
+  // long as WhatsApp is down, an enforcement is active, or the send-rate
+  // ceiling holds (see worker.ts's per-message gate). Backdating created_at
+  // simulates it having sat there past the "stalled" threshold.
+  db.exec("UPDATE messages SET created_at = datetime('now', '-11 minutes')");
+
+  const outcome = issueAndQueue(store, '963900001022', 'otp', store.otpExpiryMinutes);
+  assert.equal(outcome.kind, 'queued', 'عالق منذ وقت طويل بلا فشل صريح — يجب ألا يُعامَل كأنه سيصل');
+});
+
+test('a message that is merely pending and still recent is left alone — already_sent, not a fresh code', () => {
+  clear();
+  assert.equal(issue('963900001023'), 'queued');
+  // No time has passed and nothing failed — this must behave exactly as
+  // before this fix existed.
+  const outcome = issueAndQueue(store, '963900001023', 'otp', store.otpExpiryMinutes);
+  assert.equal(outcome.kind, 'already_sent');
+});
+
+test('the daily cap still applies even when failed messages keep forcing fresh codes', () => {
+  clear();
+  for (let i = 0; i < store.otpMaxPerDay; i++) {
+    assert.equal(issue('963900001021'), 'queued', `send ${i + 1} of the daily allowance`);
+    db.exec("UPDATE messages SET status = 'failed' WHERE status = 'pending'");
+  }
+  const blocked = issueAndQueue(store, '963900001021', 'otp', store.otpExpiryMinutes);
+  assert.equal(blocked.kind, 'rejected');
+  assert.equal(
+    blocked.kind === 'rejected' && blocked.error,
+    'daily_limit',
+    'الرسائل الفاشلة تُحسب من الحصة اليومية تماماً كالناجحة — تجاوز الانتظار لا يعني تجاوز السقف',
+  );
+});
+
 test('an expired code also falls back to a plain cooldown', () => {
   clear();
   assert.equal(issue('963900001012'), 'queued');

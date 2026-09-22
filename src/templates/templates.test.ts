@@ -30,6 +30,34 @@ test('a payload missing an optional field never yields a variant that needs it',
   }
 });
 
+test('an explicit null value is treated as missing, not as satisfying the placeholder', () => {
+  // A nullable DB column serialized straight into a /notify payload is
+  // exactly this shape — `'amount' in payload` is true even though there is
+  // nothing usable to put in the message.
+  const data = { order: '1234', amount: null } as unknown as Record<string, unknown>;
+  assert.deepEqual(missingPlaceholders('order_created', data), ['amount']);
+});
+
+test('renderTemplate treats an explicit null exactly like a missing key — falls back to a variant that does not need it, never renders the literal word "null"', () => {
+  // `delivered`'s first variant needs {name}; the other two do not — same
+  // shape as the pre-existing "missing optional field" test above, just with
+  // an explicit null instead of an absent key.
+  const data = { ...AMBIENT, order: '1234', name: null } as unknown as Record<string, string | number>;
+  for (let i = 0; i < 200; i++) {
+    const { text } = renderTemplate('delivered', data);
+    assert.doesNotMatch(text, /null/i, `rendered the literal word "null": ${text}`);
+    assert.doesNotMatch(text, /\{\w+\}/, `left a placeholder: ${text}`);
+  }
+});
+
+test('renderTemplate throws rather than substitute null when NO variant can do without the field', () => {
+  // Every order_created variant needs {amount}; an explicit null must be
+  // refused exactly like a missing key, not rendered as the literal word
+  // "null".
+  const data = { ...AMBIENT, order: '1234', amount: null } as unknown as Record<string, string | number>;
+  assert.throws(() => renderTemplate('order_created', data), /No renderable variant/);
+});
+
 test('out_for_delivery without amount is refused rather than rendered', () => {
   // Every out_for_delivery variant uses {amount}, so nothing is renderable —
   // better a loud throw than a message quoting a price of "{amount}".

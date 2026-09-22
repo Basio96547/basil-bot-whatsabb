@@ -23,13 +23,13 @@ function clear(): void {
   db.exec('DELETE FROM messages; DELETE FROM session_state;');
 }
 
-/** Records `n` messages as sent, `minutesAgo` in the past. */
-function recordSent(n: number, minutesAgo = 0): void {
+/** Records `n` messages as sent on `channel`, `minutesAgo` in the past. */
+function recordSent(n: number, minutesAgo = 0, channel: 'whatsapp' | 'sms' = 'whatsapp'): void {
   const stmt = db.prepare(
-    `INSERT INTO messages (project, event, recipient, payload, status, updated_at)
-     VALUES ('store', 'otp', '963900000000', '{}', 'sent', datetime('now', ?))`,
+    `INSERT INTO messages (project, event, recipient, payload, status, channel, updated_at)
+     VALUES ('store', 'otp', '963900000000', '{}', 'sent', ?, datetime('now', ?))`,
   );
-  for (let i = 0; i < n; i++) stmt.run(`-${minutesAgo} minutes`);
+  for (let i = 0; i < n; i++) stmt.run(channel, `-${minutesAgo} minutes`);
 }
 
 test('an empty queue is well under the ceiling', () => {
@@ -46,6 +46,24 @@ test('the ceiling blocks once the hour is used up', () => {
   assert.equal(checkSendRate(null).allowed, true, 'تحت السقف');
   recordSent(1);
   assert.equal(checkSendRate(null).allowed, false, 'عند السقف يتوقف');
+});
+
+test('SMS sends do not count toward the WhatsApp-account ceiling', () => {
+  // This ceiling protects the WhatsApp account specifically (see the module
+  // header) — SMS goes through a different provider and carries no WhatsApp
+  // ban risk, so it must not be able to trip this at all.
+  clear();
+  recordSent(50, 0, 'sms'); // far past the ceiling of 10, but the wrong channel
+  assert.equal(sentLastHour(), 0);
+  assert.equal(checkSendRate(null).allowed, true);
+});
+
+test('the ceiling still blocks once WhatsApp sends alone reach it, unaffected by SMS volume', () => {
+  clear();
+  recordSent(100, 0, 'sms');
+  recordSent(10, 0, 'whatsapp');
+  assert.equal(sentLastHour(), 10, 'SMS رسائل لا تُحسب أبداً');
+  assert.equal(checkSendRate(null).allowed, false);
 });
 
 test('sends older than an hour no longer count', () => {

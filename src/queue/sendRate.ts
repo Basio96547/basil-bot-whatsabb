@@ -21,9 +21,17 @@ import { config } from '../config.ts';
 // Counted from the messages table rather than an in-memory tally: a pm2
 // restart must not reset the budget, or a crash-loop becomes a way to send
 // without limit. `updated_at` is when the send actually happened.
+//
+// `channel = 'whatsapp'` on purpose: this ceiling exists to protect the
+// WhatsApp account specifically (see header comment), and SMS carries no
+// WhatsApp ban risk at all. Without this filter, WhatsApp volume alone could
+// push the shared counter to its ceiling and stall SMS-bound messages too —
+// worker.ts's loop used to `continue` (skipping the whole pending batch) on
+// this check, so unrelated SMS traffic silently stopped for a reason that had
+// nothing to do with it.
 const countSentSince = db.prepare(`
   SELECT COUNT(*) AS n FROM messages
-  WHERE status = 'sent' AND updated_at > datetime('now', ?)
+  WHERE status = 'sent' AND channel = 'whatsapp' AND updated_at > datetime('now', ?)
 `);
 
 /** Sends in the last hour, as recorded by the queue itself. */

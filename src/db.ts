@@ -61,6 +61,10 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_messages_status_created ON messages(status, created_at);
   CREATE INDEX IF NOT EXISTS idx_messages_recipient ON messages(recipient);
+  -- Covers sendRate.ts's countSentSince (status='sent' AND channel='whatsapp'
+  -- AND updated_at > ...), now run once per WhatsApp-channel message instead
+  -- of once per batch — without this it is a full table scan on every one.
+  CREATE INDEX IF NOT EXISTS idx_messages_status_channel_updated ON messages(status, channel, updated_at);
 
   CREATE TABLE IF NOT EXISTS otp_codes (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -118,14 +122,32 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_reset_tokens_hash ON reset_tokens(token_hash);
 `);
 
-// Runs a one-off `ALTER TABLE ... ADD COLUMN` migration, tolerating only the
-// one error that means "already migrated". A bare `catch {}` here would also
-// swallow a genuinely failed migration (disk full, a locked file) — the
-// column would then silently not exist, and the failure would only surface
-// later as a confusing "no such column" from an unrelated query.
-function addColumnIfMissing(sql: string): void {
+// Whether `table` already has `column` — the authoritative check (SQLite's own
+// schema introspection), not a guess from an error message. Exported for
+// testing alongside addColumnIfMissing below.
+//
+// `table`/`column` are interpolated directly into the PRAGMA/ALTER TABLE SQL
+// below with no escaping — fine as long as every caller passes a hardcoded
+// literal (as all of them do, right below), but this pair must never be
+// called with a table/column name built from a variable or user input.
+export function columnExists(table: string, column: string): boolean {
+  const rows = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+  return rows.some((row) => row.name === column);
+}
+
+// Runs a one-off `ALTER TABLE ... ADD COLUMN` migration. PRAGMA table_info is
+// checked FIRST and is what actually decides "already migrated" — it reads
+// SQLite's own schema, so it cannot be fooled by a driver's error wording.
+// The catch below is now only a defensive fallback for a race against another
+// process making the same change, and still tolerates only the one error that
+// means "already migrated": a bare `catch {}` here would also swallow a
+// genuinely failed migration (disk full, a locked file) — the column would
+// then silently not exist, and the failure would only surface later as a
+// confusing "no such column" from an unrelated query.
+export function addColumnIfMissing(table: string, column: string, definition: string): void {
+  if (columnExists(table, column)) return;
   try {
-    db.exec(sql);
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
   } catch (error) {
     if (error instanceof Error && error.message.includes('duplicate column name')) return;
     throw error;
@@ -134,11 +156,19 @@ function addColumnIfMissing(sql: string): void {
 
 // Migration: add purpose column so login and password-reset OTPs have separate
 // cooldowns and cannot be cross-verified. Existing rows get 'login' by default.
-addColumnIfMissing(`ALTER TABLE otp_codes ADD COLUMN purpose TEXT NOT NULL DEFAULT 'login'`);
+addColumnIfMissing('otp_codes', 'purpose', `TEXT NOT NULL DEFAULT 'login'`);
 
 // Migration: a queued message is only worth sending for so long. After a long
 // outage the queue drains in creation order, and without this an OTP that sat
 // there for an hour still went out — arriving as a code that expired 50
 // minutes ago. NULL means "no deadline" (rows queued before this column
 // existed, and any future event where late is still better than never).
-addColumnIfMissing(`ALTER TABLE messages ADD COLUMN expires_at TEXT`);
+addColumnIfMissing('messages', 'expires_at', 'TEXT');
+
+// Migration: links an OTP row to the message that was queued to deliver it, so
+// a repeat request can tell "a live code exists" apart from "and the message
+// that would deliver it hasn't already failed permanently" — see the
+// already_sent branch in otp.ts. NULL for codes issued before this column
+// existed, and already_sent treats that exactly like "unknown, assume fine"
+// (its pre-existing behavior).
+addColumnIfMissing('otp_codes', 'message_id', 'INTEGER');
