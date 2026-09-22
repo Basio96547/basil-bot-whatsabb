@@ -25,5 +25,13 @@
         "{code} — كود تغيير كلمة المرور في {brand}. صالح {expiryMinutes} دقائق."
       ]
     }
+  },
+  {
+    "id": "fireworks",
+    "brandName": "متجر الألعاب النارية",
+    "resendCooldownMinutes": 10,
+    "otpExpiryMinutes": 10,
+    "otpMaxAttempts": 5,
+    "otpMaxPerDay": 5
   }
 ]
