@@ -14,6 +14,13 @@ import path from 'node:path';
 
 process.env.DATA_DIR = mkdtempSync(path.join(tmpdir(), 'sms-api-otp-'));
 
+// config.ts requires these at import time; the real values live in .env
+// (gitignored), which a fresh checkout does not have.
+process.env.PROJECT_API_KEY_STORE ??= 'test-store-key';
+process.env.PROJECT_API_KEY_QAREEB ??= 'test-qareeb-key';
+process.env.OTP_HASH_SECRET ??= 'test-otp-hash-secret';
+process.env.SESSION_BACKUP_ENCRYPTION_KEY ??= 'test-session-backup-key';
+
 const { generateOtp, verifyOtp } = await import('./otp.ts');
 const { db } = await import('../db.ts');
 const { getProjectById } = await import('../config.ts');

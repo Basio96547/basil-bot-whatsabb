@@ -16,6 +16,13 @@ import path from 'node:path';
 
 process.env.DATA_DIR = mkdtempSync(path.join(tmpdir(), 'sms-api-backup-'));
 
+// config.ts requires these at import time; the real values live in .env
+// (gitignored), which a fresh checkout does not have.
+process.env.PROJECT_API_KEY_STORE ??= 'test-store-key';
+process.env.PROJECT_API_KEY_QAREEB ??= 'test-qareeb-key';
+process.env.OTP_HASH_SECRET ??= 'test-otp-hash-secret';
+process.env.SESSION_BACKUP_ENCRYPTION_KEY ??= 'test-session-backup-key';
+
 const { snapshotLocal, restoreFromLocal } = await import('./sessionBackup.ts');
 
 const AUTH_DIR = path.join(process.env.DATA_DIR, 'auth-session');
