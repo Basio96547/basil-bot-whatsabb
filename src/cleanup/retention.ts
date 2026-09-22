@@ -47,8 +47,18 @@ export function runRetentionSweep(): { messagesDeleted: number; otpDeleted: numb
 
 export function scheduleDailyRetention(): void {
   const sweep = () => {
-    const result = runRetentionSweep();
-    console.log(`[retention] deleted ${result.messagesDeleted} old message(s), ${result.otpDeleted} spent OTP code(s), ${result.resetTokensDeleted} spent reset token(s), ${result.sendLogDeleted} old send-log row(s)`);
+    // A throw here used to be fatal: this runs inside a setInterval callback,
+    // where nothing can catch it, so a full disk or a locked database took the
+    // whole process down. pm2 would restart it, and every restart forces a
+    // fresh WhatsApp reconnect — the one cost this codebase works hardest to
+    // avoid (see ecosystem.config.cjs on max_memory_restart). Housekeeping
+    // failing is not a reason to drop the service; log it and retry tomorrow.
+    try {
+      const result = runRetentionSweep();
+      console.log(`[retention] deleted ${result.messagesDeleted} old message(s), ${result.otpDeleted} spent OTP code(s), ${result.resetTokensDeleted} spent reset token(s), ${result.sendLogDeleted} old send-log row(s)`);
+    } catch (error) {
+      console.error('[retention] فشل التنظيف الدوري — سيُعاد غداً', error);
+    }
   };
   sweep(); // once at boot, then daily — no external cron needed (plan 10)
   setInterval(sweep, SWEEP_INTERVAL_MS);

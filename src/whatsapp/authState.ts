@@ -59,9 +59,28 @@ async function writeAtomic(filePath: string, contents: string): Promise<void> {
     await handle.close();
   }
   await rename(tmpPath, filePath);
+
+  // rename() is atomic for concurrent READERS, but durability across a power
+  // cut also needs the directory entry itself flushed — otherwise the file's
+  // contents are on disk while the name still points at the old version (or
+  // nowhere), leaving a stray .tmp behind. That is the crash case the header
+  // cites as this function's whole reason to exist.
+  //
+  // Best-effort: some platforms refuse to open a directory for fsync (Windows
+  // in particular), and there the write is still no worse than before.
+  try {
+    const dir = await open(path.dirname(filePath), 'r');
+    try {
+      await dir.sync();
+    } finally {
+      await dir.close();
+    }
+  } catch {
+    /* directory fsync unsupported here — nothing further to do */
+  }
 }
 
-export type CredsProbe = 'ok' | 'missing' | 'corrupt';
+export type CredsProbe = 'ok' | 'missing' | 'corrupt' | 'unreadable';
 
 // Answers "is there a usable WhatsApp identity on disk?" without creating one.
 // Call this BEFORE useAtomicMultiFileAuthState so a restore can run first.
@@ -70,8 +89,13 @@ export async function probeCreds(folder: string): Promise<CredsProbe> {
   let raw: string;
   try {
     raw = await readFile(filePath, { encoding: 'utf-8' });
-  } catch {
-    return 'missing';
+  } catch (error) {
+    // ENOENT is a genuinely absent session. Anything else (EACCES, EBUSY,
+    // EMFILE from the ~7500-file key folder, or Android's own filesystem
+    // activity) means the file is there but momentarily unreadable — and
+    // reporting that as 'missing' made the caller restore a possibly stale
+    // backup OVER a healthy live session, losing every key rotated since.
+    return (error as { code?: string }).code === 'ENOENT' ? 'missing' : 'unreadable';
   }
   try {
     JSON.parse(raw, BufferJSON.reviver);
