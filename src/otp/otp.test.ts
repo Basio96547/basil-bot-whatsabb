@@ -5,6 +5,12 @@
 //
 // DATA_DIR is redirected before db.ts is imported so this runs against a
 // throwaway SQLite file, never the live queue.
+//
+// PROJECT_API_KEY_*/OTP_HASH_SECRET are given fallback values (`??=`, so a
+// real .env is still respected where present) because config.ts requires
+// them for EVERY project in config/projects.json at import time — on a
+// fresh checkout with no .env yet (a clean clone, or CI), this file failed
+// before a single test ran, unrelated to anything it actually tests.
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -13,6 +19,11 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 
 process.env.DATA_DIR = mkdtempSync(path.join(tmpdir(), 'sms-api-otp-'));
+process.env.PROJECT_API_KEY_STORE ??= 'test-store-key';
+process.env.PROJECT_API_KEY_QAREEB ??= 'test-qareeb-key';
+process.env.PROJECT_API_KEY_FIREWORKS ??= 'test-fireworks-key';
+process.env.OTP_HASH_SECRET ??= 'test-otp-hash-secret';
+process.env.SESSION_BACKUP_ENCRYPTION_KEY ??= 'test-passphrase-for-backup-roundtrip';
 
 const { generateOtp, verifyOtp } = await import('./otp.ts');
 const { db } = await import('../db.ts');

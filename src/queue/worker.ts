@@ -31,8 +31,11 @@ function randomDelay(): number {
 
 // Unblocks the worker loop after SEND_TIMEOUT_MS even if the underlying call
 // never settles — it doesn't cancel the in-flight WhatsApp/SMS call itself,
-// just stops one stuck send from freezing every message behind it.
-function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+// just stops one stuck send from freezing every message behind it. Exported
+// for testing: resolveChannel()'s own call site below needs the exact same
+// guarantee (Baileys' onWhatsApp() has no timeout of its own), and a real
+// SEND_TIMEOUT_MS-length test here would be far too slow for this suite.
+export function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   return Promise.race([
     promise,
     new Promise<T>((_, reject) => setTimeout(() => reject(new Error('timeout')), ms)),
@@ -94,7 +97,13 @@ export async function processMessage(msg: MessageRow, gateDeps: WhatsAppGateDeps
   const forcedChannel = msg.channel_forced ? (msg.channel as Channel) : undefined;
   let channel: Channel;
   try {
-    channel = await resolveChannel(msg.recipient, forcedChannel);
+    // resolveChannel() routes to Baileys' onWhatsApp(), whose own query has
+    // no timeout of its own and can hang for a long time on a bad
+    // connection — unlike every other outbound call on this path
+    // (sendViaChannel below), this await had nothing bounding it, so one
+    // slow/hung lookup could block this whole batch of up to
+    // sendBatchSize messages for minutes.
+    channel = await withTimeout(resolveChannel(msg.recipient, forcedChannel), SEND_TIMEOUT_MS);
   } catch {
     recordFailedAttempt(msg.id, msg.channel ?? 'whatsapp', 'channel_resolution_error');
     return false;
@@ -212,12 +221,29 @@ async function loop(): Promise<void> {
   };
 
   for (;;) {
+    // The whole tick is guarded: startWorker() does `void loop()`, so a throw
+    // anywhere in here (getPendingBatch()/getConnectionState() hitting a full
+    // disk or a locked db, or anything else unanticipated) used to reject
+    // this promise with nothing to catch it — an unhandled rejection that
+    // took the whole process down, and with it the live WhatsApp socket.
+    // Housekeeping failing here is not a reason to drop the service; log it,
+    // back off, and let the next tick try again — same philosophy as
+    // retention.ts's own sweep guard.
+    try {
+      await runOneTick();
+    } catch (err) {
+      console.error('[worker] خطأ غير متوقع في حلقة العامل — سيُعاد المحاولة بعد تراجع', err);
+      await backOff();
+    }
+  }
+
+  async function runOneTick(): Promise<void> {
     // Nothing can go out at all while the only configured channel is down.
     // Without this the loop would still walk the whole batch just to skip
     // every row. عودة واتساب تستدعي notifyWork() فتقطع هذا الانتظار فوراً.
     if (!getConnectionState().connected && !config.sms.enabled) {
       await backOff();
-      continue;
+      return;
     }
 
     // An active restriction from WhatsApp itself, and this account's own
@@ -249,7 +275,7 @@ async function loop(): Promise<void> {
     const batch = getPendingBatch(config.queue.sendBatchSize); // plan 9, point 3
     if (batch.length === 0) {
       await backOff();
-      continue;
+      return;
     }
 
     let sentAnything = false;

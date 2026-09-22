@@ -24,9 +24,17 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 
 process.env.DATA_DIR = mkdtempSync(path.join(tmpdir(), 'sms-api-worker-'));
+// config.ts requires one of these per project in config/projects.json at
+// import time, unrelated to anything this file actually tests — on a fresh
+// checkout with no .env yet, this file failed before a single test ran.
+process.env.PROJECT_API_KEY_STORE ??= 'test-store-key';
+process.env.PROJECT_API_KEY_QAREEB ??= 'test-qareeb-key';
+process.env.PROJECT_API_KEY_FIREWORKS ??= 'test-fireworks-key';
+process.env.OTP_HASH_SECRET ??= 'test-otp-hash-secret';
+process.env.SESSION_BACKUP_ENCRYPTION_KEY ??= 'test-passphrase-for-backup-roundtrip';
 
 const { enqueue, getPendingBatch } = await import('./queue.ts');
-const { processMessage, defaultGateDeps } = await import('./worker.ts');
+const { processMessage, defaultGateDeps, withTimeout } = await import('./worker.ts');
 const { db } = await import('../db.ts');
 
 function clear(): void {
@@ -126,4 +134,19 @@ test('a WhatsApp message is attempted (not blocked) once connected, unrestricted
   // is no longer sitting untouched), proving the gate did not block it.
   const attempted = await processMessage(msg, alwaysOpen);
   assert.equal(attempted, true, 'the gate must not block a healthy, unrestricted, under-ceiling connection');
+});
+
+// resolveChannel() routes to Baileys' onWhatsApp(), which has no timeout of
+// its own — a hung lookup used to block a whole batch of messages
+// indefinitely, unlike every other outbound call on this path. The real
+// SEND_TIMEOUT_MS is 15s (too slow to exercise directly here), so this pins
+// the shared withTimeout() mechanism itself with a short ms value instead.
+test('withTimeout rejects a promise that never settles, instead of hanging forever', async () => {
+  const neverSettles = new Promise<void>(() => {});
+  await assert.rejects(() => withTimeout(neverSettles, 50), /timeout/);
+});
+
+test('withTimeout resolves normally when the underlying promise settles first', async () => {
+  const fast = Promise.resolve('ok');
+  assert.equal(await withTimeout(fast, 50), 'ok');
 });

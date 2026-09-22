@@ -13,6 +13,14 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 
 process.env.DATA_DIR = mkdtempSync(path.join(tmpdir(), 'sms-api-enf-'));
+// config.ts requires one of these per project in config/projects.json at
+// import time, unrelated to anything this file actually tests — on a fresh
+// checkout with no .env yet, this file failed before a single test ran.
+process.env.PROJECT_API_KEY_STORE ??= 'test-store-key';
+process.env.PROJECT_API_KEY_QAREEB ??= 'test-qareeb-key';
+process.env.PROJECT_API_KEY_FIREWORKS ??= 'test-fireworks-key';
+process.env.OTP_HASH_SECRET ??= 'test-otp-hash-secret';
+process.env.SESSION_BACKUP_ENCRYPTION_KEY ??= 'test-passphrase-for-backup-roundtrip';
 
 const { parseEnforcement, recordEnforcement, activeEnforcement } = await import('./enforcement.ts');
 const { db } = await import('../db.ts');

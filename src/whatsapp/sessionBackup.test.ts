@@ -23,6 +23,13 @@ process.env.SESSION_BACKUP_ENCRYPTION_KEY ??= 'test-passphrase-for-backup-roundt
 process.env.R2_ACCOUNT_ID ??= 'test-account';
 process.env.R2_ACCESS_KEY_ID ??= 'test-access-key';
 process.env.R2_SECRET_ACCESS_KEY ??= 'test-secret';
+// config.ts requires one of these per project in config/projects.json at
+// import time, unrelated to anything this file actually tests — on a fresh
+// checkout with no .env yet, this file failed before a single test ran.
+process.env.PROJECT_API_KEY_STORE ??= 'test-store-key';
+process.env.PROJECT_API_KEY_QAREEB ??= 'test-qareeb-key';
+process.env.PROJECT_API_KEY_FIREWORKS ??= 'test-fireworks-key';
+process.env.OTP_HASH_SECRET ??= 'test-otp-hash-secret';
 
 const {
   snapshotLocal,

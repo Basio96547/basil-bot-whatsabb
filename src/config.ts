@@ -40,6 +40,16 @@ function requireEnv(name: string): string {
   return value;
 }
 
+// `Number(process.env.X ?? fallback)` only falls back when X is UNSET — an
+// empty string left in .env (`X=`) is not undefined, so `?? fallback` never
+// triggers and `Number('')` silently evaluates to 0. A blank
+// SEND_BATCH_SIZE or SEND_MIN_DELAY_MS this way doesn't throw anywhere; it
+// just quietly zeroes a limit that was supposed to have a sane default.
+function numberEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  return raw === undefined || raw === '' ? fallback : Number(raw);
+}
+
 // Same fail-fast contract as requireEnv: a malformed template block stops the
 // service at boot instead of surfacing as a broken message weeks later.
 function requireValidTemplates(projectId: string, templates: TemplateOverrides | undefined): void {
@@ -82,7 +92,7 @@ export function getProjectByApiKey(apiKey: string): ProjectConfig | undefined {
 }
 
 export const config = {
-  port: Number(process.env.PORT ?? 3000),
+  port: numberEnv('PORT', 3000),
   dataDir: path.resolve(repoRoot, process.env.DATA_DIR ?? './data'),
   otpHashSecret: requireEnv('OTP_HASH_SECRET'),
   whatsappNumber: process.env.WHATSAPP_NUMBER ?? '',
@@ -92,7 +102,7 @@ export const config = {
     // radio. Configurable because raising it too far lets the server drop the
     // socket as idle, which costs a reconnect — and reconnect churn on an
     // unofficial client is itself a ban signal.
-    keepAliveIntervalMs: Number(process.env.KEEP_ALIVE_INTERVAL_MS ?? 60_000),
+    keepAliveIntervalMs: numberEnv('KEEP_ALIVE_INTERVAL_MS', 60_000),
   },
 
   // Ceiling on TOTAL messages leaving this service, independent of the
@@ -109,12 +119,12 @@ export const config = {
   // stops draining until the window rolls, and short-lived OTPs expire out on
   // their own TTL instead of arriving stale.
   sendRate: {
-    maxPerHour: Number(process.env.SEND_MAX_PER_HOUR ?? 120),
+    maxPerHour: numberEnv('SEND_MAX_PER_HOUR', 120),
     // A freshly paired number is at its most fragile — this is exactly when a
     // re-pair after an enforcement happens. Its first hours run at a fraction
     // of the normal ceiling.
-    warmupHours: Number(process.env.SEND_WARMUP_HOURS ?? 24),
-    warmupMaxPerHour: Number(process.env.SEND_WARMUP_MAX_PER_HOUR ?? 30),
+    warmupHours: numberEnv('SEND_WARMUP_HOURS', 24),
+    warmupMaxPerHour: numberEnv('SEND_WARMUP_MAX_PER_HOUR', 30),
   },
 
   sessionBackup: {
@@ -138,17 +148,17 @@ export const config = {
   },
 
   queue: {
-    maxPending: Number(process.env.QUEUE_MAX_PENDING ?? 5000),
+    maxPending: numberEnv('QUEUE_MAX_PENDING', 5000),
     // Plan 9 point 2 bounded the AGGREGATE queue, shared by every project on
     // this one WhatsApp number, but nothing bounded what ONE of them could
     // occupy inside it — a leaked or misbehaving API key for a single project
     // could fill the shared queue and starve OTP delivery for every other
     // tenant. Default well below the aggregate cap so no single project can
     // come close to dominating it, while staying far above real traffic.
-    maxPendingPerProject: Number(process.env.QUEUE_MAX_PENDING_PER_PROJECT ?? 1000),
-    sendBatchSize: Number(process.env.SEND_BATCH_SIZE ?? 20),
-    sendMinDelayMs: Number(process.env.SEND_MIN_DELAY_MS ?? 3000),
-    sendMaxDelayMs: Number(process.env.SEND_MAX_DELAY_MS ?? 9000),
+    maxPendingPerProject: numberEnv('QUEUE_MAX_PENDING_PER_PROJECT', 1000),
+    sendBatchSize: numberEnv('SEND_BATCH_SIZE', 20),
+    sendMinDelayMs: numberEnv('SEND_MIN_DELAY_MS', 3000),
+    sendMaxDelayMs: numberEnv('SEND_MAX_DELAY_MS', 9000),
   },
 
   projects,
