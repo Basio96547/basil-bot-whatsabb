@@ -96,17 +96,37 @@ export async function processMessage(msg: MessageRow, gateDeps: WhatsAppGateDeps
 
   const forcedChannel = msg.channel_forced ? (msg.channel as Channel) : undefined;
   let channel: Channel;
-  try {
-    // resolveChannel() routes to Baileys' onWhatsApp(), whose own query has
-    // no timeout of its own and can hang for a long time on a bad
-    // connection — unlike every other outbound call on this path
-    // (sendViaChannel below), this await had nothing bounding it, so one
-    // slow/hung lookup could block this whole batch of up to
-    // sendBatchSize messages for minutes.
-    channel = await withTimeout(resolveChannel(msg.recipient, forcedChannel), SEND_TIMEOUT_MS);
-  } catch {
-    recordFailedAttempt(msg.id, msg.channel ?? 'whatsapp', 'channel_resolution_error');
-    return false;
+  if (!forcedChannel && !gateDeps.isConnected()) {
+    // resolveChannel() calls Baileys' onWhatsApp() for any recipient not
+    // already in the existence cache, which needs a live socket. During a
+    // reconnect flap (frequent on this phone's network — plain
+    // "connectionClosed" drops every few minutes) that call either throws
+    // right away or hangs until SEND_TIMEOUT_MS, and either way the catch
+    // below used to burn one of only 5 attempts on a failure that has
+    // nothing to do with this recipient. A handful of those flaps back to
+    // back could exhaust all 5 and permanently fail a message the socket
+    // would have delivered seconds later. Route straight to SMS if it's
+    // configured, otherwise leave the message pending — the same outcome
+    // the whatsappBlocked gate below already gives a message whose channel
+    // WAS resolved, just reached before resolution wastes an attempt on it.
+    if (config.sms.enabled && !isPaused('sms')) {
+      channel = 'sms';
+    } else {
+      return false;
+    }
+  } else {
+    try {
+      // resolveChannel() routes to Baileys' onWhatsApp(), whose own query has
+      // no timeout of its own and can hang for a long time on a bad
+      // connection — unlike every other outbound call on this path
+      // (sendViaChannel below), this await had nothing bounding it, so one
+      // slow/hung lookup could block this whole batch of up to
+      // sendBatchSize messages for minutes.
+      channel = await withTimeout(resolveChannel(msg.recipient, forcedChannel), SEND_TIMEOUT_MS);
+    } catch {
+      recordFailedAttempt(msg.id, msg.channel ?? 'whatsapp', 'channel_resolution_error');
+      return false;
+    }
   }
 
   // Plan 4.6: no WhatsApp on this number and no SMS provider wired yet — this
