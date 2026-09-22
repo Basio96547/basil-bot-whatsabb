@@ -40,6 +40,15 @@ function requireEnv(name: string): string {
   return value;
 }
 
+// `Number(process.env.X ?? fallback)` only falls back when X is unset — an
+// env var explicitly set to '' (common with templated deployment configs)
+// passes `??` untouched and becomes `Number('') === 0`, silently zeroing
+// things like the queue's send-pacing delay instead of using the default.
+function numberEnv(name: string, fallback: number): number {
+  const value = process.env[name];
+  return value ? Number(value) : fallback;
+}
+
 // Same fail-fast contract as requireEnv: a malformed template block stops the
 // service at boot instead of surfacing as a broken message weeks later.
 function requireValidTemplates(projectId: string, templates: TemplateOverrides | undefined): void {
@@ -82,7 +91,7 @@ export function getProjectByApiKey(apiKey: string): ProjectConfig | undefined {
 }
 
 export const config = {
-  port: Number(process.env.PORT ?? 3000),
+  port: numberEnv('PORT', 3000),
   dataDir: path.resolve(repoRoot, process.env.DATA_DIR ?? './data'),
   otpHashSecret: requireEnv('OTP_HASH_SECRET'),
   whatsappNumber: process.env.WHATSAPP_NUMBER ?? '',
@@ -108,10 +117,10 @@ export const config = {
   },
 
   queue: {
-    maxPending: Number(process.env.QUEUE_MAX_PENDING ?? 5000),
-    sendBatchSize: Number(process.env.SEND_BATCH_SIZE ?? 20),
-    sendMinDelayMs: Number(process.env.SEND_MIN_DELAY_MS ?? 3000),
-    sendMaxDelayMs: Number(process.env.SEND_MAX_DELAY_MS ?? 9000),
+    maxPending: numberEnv('QUEUE_MAX_PENDING', 5000),
+    sendBatchSize: numberEnv('SEND_BATCH_SIZE', 20),
+    sendMinDelayMs: numberEnv('SEND_MIN_DELAY_MS', 3000),
+    sendMaxDelayMs: numberEnv('SEND_MAX_DELAY_MS', 9000),
   },
 
   projects,

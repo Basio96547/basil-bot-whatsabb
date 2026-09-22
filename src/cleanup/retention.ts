@@ -47,8 +47,15 @@ export function runRetentionSweep(): { messagesDeleted: number; otpDeleted: numb
 
 export function scheduleDailyRetention(): void {
   const sweep = () => {
-    const result = runRetentionSweep();
-    console.log(`[retention] deleted ${result.messagesDeleted} old message(s), ${result.otpDeleted} spent OTP code(s), ${result.resetTokensDeleted} spent reset token(s), ${result.sendLogDeleted} old send-log row(s)`);
+    try {
+      const result = runRetentionSweep();
+      console.log(`[retention] deleted ${result.messagesDeleted} old message(s), ${result.otpDeleted} spent OTP code(s), ${result.resetTokensDeleted} spent reset token(s), ${result.sendLogDeleted} old send-log row(s)`);
+    } catch (err) {
+      // A synchronous throw here is an uncaught exception inside a setInterval
+      // callback — nothing in this process catches that, so it would crash
+      // the whole service (and the live WhatsApp socket) over one bad sweep.
+      console.error('[retention] sweep failed', err);
+    }
   };
   sweep(); // once at boot, then daily — no external cron needed (plan 10)
   setInterval(sweep, SWEEP_INTERVAL_MS);

@@ -74,7 +74,10 @@ async function processMessage(msg: MessageRow): Promise<boolean> {
   const forcedChannel = msg.channel_forced ? (msg.channel as Channel) : undefined;
   let channel: Channel;
   try {
-    channel = await resolveChannel(msg.recipient, forcedChannel);
+    // Baileys' own onWhatsApp() query defaults to a 60s timeout with no
+    // override from this app — far past SEND_TIMEOUT_MS, and unlike
+    // sendViaChannel below this call was never raced against it.
+    channel = await withTimeout(resolveChannel(msg.recipient, forcedChannel), SEND_TIMEOUT_MS);
   } catch {
     recordFailedAttempt(msg.id, msg.channel ?? 'whatsapp', 'channel_resolution_error');
     return false;
@@ -165,41 +168,51 @@ async function loop(): Promise<void> {
   };
 
   for (;;) {
-    // Nothing can go out at all while the only configured channel is down.
-    // Without this the loop would still walk the whole batch just to skip
-    // every row. عودة واتساب تستدعي notifyWork() فتقطع هذا الانتظار فوراً.
-    if (!getConnectionState().connected && !config.sms.enabled) {
-      await backOff();
-      continue;
-    }
-
-    const batch = getPendingBatch(config.queue.sendBatchSize); // plan 9, point 3
-    if (batch.length === 0) {
-      await backOff();
-      continue;
-    }
-
-    let sentAnything = false;
-    for (const msg of batch) {
-      let attempted = false;
-      try {
-        attempted = await processMessage(msg);
-      } catch (err) {
-        console.error(`[worker] unexpected error processing message ${msg.id}`, err);
+    try {
+      // Nothing can go out at all while the only configured channel is down.
+      // Without this the loop would still walk the whole batch just to skip
+      // every row. عودة واتساب تستدعي notifyWork() فتقطع هذا الانتظار فوراً.
+      if (!getConnectionState().connected && !config.sms.enabled) {
+        await backOff();
+        continue;
       }
-      if (attempted) {
-        sentAnything = true;
-        await sleep(randomDelay()); // plan 5, point 3 — human-like pacing
-      }
-    }
 
-    if (sentAnything) {
-      idleDelay = IDLE_MIN_DELAY_MS; // في نوبة عمل — عُد إلى أسرع نبضة
-    } else {
-      // الدفعة غير فارغة لكن ولا صف منها خرج (قناة موقوفة، واتساب مقطوع
-      // ورسائل مثبَّتة على قناة). بلا هذا التراجع تصير الحلقة حلقةَ ازدحام
-      // حقيقية: تقرأ نفس الصفوف بأقصى سرعة يردّ بها SQLite، بلا أي مهلة —
-      // وهذا أسوأ من السلوك القديم الذي كانت المباعدة تكبحه بالصدفة.
+      const batch = getPendingBatch(config.queue.sendBatchSize); // plan 9, point 3
+      if (batch.length === 0) {
+        await backOff();
+        continue;
+      }
+
+      let sentAnything = false;
+      for (const msg of batch) {
+        let attempted = false;
+        try {
+          attempted = await processMessage(msg);
+        } catch (err) {
+          console.error(`[worker] unexpected error processing message ${msg.id}`, err);
+        }
+        if (attempted) {
+          sentAnything = true;
+          await sleep(randomDelay()); // plan 5, point 3 — human-like pacing
+        }
+      }
+
+      if (sentAnything) {
+        idleDelay = IDLE_MIN_DELAY_MS; // في نوبة عمل — عُد إلى أسرع نبضة
+      } else {
+        // الدفعة غير فارغة لكن ولا صف منها خرج (قناة موقوفة، واتساب مقطوع
+        // ورسائل مثبَّتة على قناة). بلا هذا التراجع تصير الحلقة حلقةَ ازدحام
+        // حقيقية: تقرأ نفس الصفوف بأقصى سرعة يردّ بها SQLite، بلا أي مهلة —
+        // وهذا أسوأ من السلوك القديم الذي كانت المباعدة تكبحه بالصدفة.
+        await backOff();
+      }
+    } catch (err) {
+      // getPendingBatch()/getConnectionState() are the only calls left
+      // unguarded above — a synchronous SQLite error here used to reject
+      // loop()'s promise with no .catch anywhere (startWorker does `void
+      // loop()`), which crashes the whole process and the live WhatsApp
+      // socket with it. Log and back off instead of taking the service down.
+      console.error('[worker] unexpected error in main loop', err);
       await backOff();
     }
   }
