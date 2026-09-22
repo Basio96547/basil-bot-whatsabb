@@ -95,8 +95,14 @@ export async function processMessage(msg: MessageRow, gateDeps: WhatsAppGateDeps
   }
 
   const forcedChannel = msg.channel_forced ? (msg.channel as Channel) : undefined;
+  // Read once, used only for this synchronous check. The whatsappBlocked
+  // gate below reads gateDeps.isConnected() again rather than reusing this —
+  // an await (resolveChannel, in the branch below) sits between the two, so
+  // the connection can genuinely change state in between; reusing a stale
+  // value there would be a real bug, not just a missed dedup.
+  const connected = gateDeps.isConnected();
   let channel: Channel;
-  if (!forcedChannel && !gateDeps.isConnected()) {
+  if (!forcedChannel && !connected) {
     // resolveChannel() calls Baileys' onWhatsApp() for any recipient not
     // already in the existence cache, which needs a live socket. During a
     // reconnect flap (frequent on this phone's network — plain
