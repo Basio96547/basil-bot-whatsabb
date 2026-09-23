@@ -33,7 +33,7 @@ process.env.PROJECT_API_KEY_FIREWORKS ??= 'test-fireworks-key';
 process.env.OTP_HASH_SECRET ??= 'test-otp-hash-secret';
 process.env.SESSION_BACKUP_ENCRYPTION_KEY ??= 'test-passphrase-for-backup-roundtrip';
 
-const { enqueue, getPendingBatch } = await import('./queue.ts');
+const { enqueue, getPendingBatch, supersedePending, markSentIfStillPending, markSent } = await import('./queue.ts');
 const { processMessage, defaultGateDeps, withTimeout } = await import('./worker.ts');
 const { db } = await import('../db.ts');
 
@@ -124,6 +124,32 @@ test('a WhatsApp message stays pending while the hourly send-rate ceiling is exc
   assert.equal(getPendingBatch(10).length, 1, 'still pending, not failed');
 });
 
+test('a WhatsApp message stays pending — and is not charged an attempt — while disconnected and unforced', async () => {
+  clear();
+  const result = enqueue({
+    project: 'store',
+    event: 'delivered',
+    recipient: '963900000000',
+    payload: { order: '1' },
+    channel: 'whatsapp',
+  });
+  const id = (result as { id: number }).id;
+  const [msg] = getPendingBatch(1);
+
+  // Regression: resolveChannel() used to run unconditionally, calling
+  // Baileys' onWhatsApp() (needs a live socket) even while disconnected.
+  // getSocket() would throw synchronously here (no test socket exists),
+  // which the old code counted as a channel_resolution_error attempt — so a
+  // reconnect flap could burn all 5 tries before the socket ever came back.
+  const disconnected = { ...alwaysOpen, isConnected: () => false };
+  const attempted = await processMessage(msg, disconnected);
+
+  assert.equal(attempted, false);
+  const row = rowOf(id);
+  assert.equal(row.status, 'pending');
+  assert.equal(row.attempts, 0, 'a disconnect must not spend one of the 5 attempts');
+});
+
 test('a WhatsApp message is attempted (not blocked) once connected, unrestricted, and under the ceiling', async () => {
   clear();
   enqueue({ project: 'store', event: 'delivered', recipient: '963900000000', payload: { order: '1' }, channel: 'whatsapp' });
@@ -134,6 +160,62 @@ test('a WhatsApp message is attempted (not blocked) once connected, unrestricted
   // is no longer sitting untouched), proving the gate did not block it.
   const attempted = await processMessage(msg, alwaysOpen);
   assert.equal(attempted, true, 'the gate must not block a healthy, unrestricted, under-ceiling connection');
+});
+
+test('a message superseded after its batch was read is not sent', async () => {
+  // The batch is read up to a whole round of pacing delays before a row's
+  // turn comes; a newer code for the same number can supersede it meanwhile.
+  clear();
+  enqueue({ project: 'store', event: 'otp', recipient: '963900000100', payload: { code: '111111' }, channel: 'whatsapp' });
+  const [msg] = getPendingBatch(1);
+  supersedePending('store', '963900000100', 'otp');
+
+  const attempted = await processMessage(msg, alwaysOpen);
+  assert.equal(attempted, false, 'must not go out');
+  assert.equal(rowOf(msg.id).status, 'failed');
+  assert.equal(rowOf(msg.id).last_error, 'superseded');
+});
+
+test('a message that expires before it is sent is marked as never sent, so the daily cap can refund it', async () => {
+  clear();
+  enqueue({ project: 'store', event: 'delivered', recipient: '963900000101', payload: { order: '1' }, ttlMinutes: 1 });
+  db.exec(`UPDATE messages SET expires_at = datetime('now', '-1 minutes')`);
+  const [msg] = getPendingBatch(1);
+  await processMessage(msg, alwaysOpen);
+  const row = db.prepare('SELECT status, last_error, dropped_unsent FROM messages WHERE id = ?').get(msg.id) as {
+    status: string;
+    last_error: string;
+    dropped_unsent: number;
+  };
+  assert.deepEqual({ ...row }, { status: 'failed', last_error: 'expired_before_send', dropped_unsent: 1 });
+});
+
+test('rows forced onto a blocked channel do not fill the batch and hide the rows behind them', () => {
+  clear();
+  for (let i = 0; i < 3; i++) {
+    enqueue({ project: 'store', event: 'delivered', recipient: `96390000020${i}`, payload: { order: '1' }, channel: 'whatsapp' });
+  }
+  const free = enqueue({ project: 'store', event: 'delivered', recipient: '963900000209', payload: { order: '1' } });
+  assert.equal(getPendingBatch(3).length, 3);
+  assert.deepEqual(
+    getPendingBatch(3, ['whatsapp']).map((m) => m.id),
+    [(free as { id: number }).id],
+    'only the auto-routed row is fetched while WhatsApp is blocked',
+  );
+});
+
+test('a send that completes after its timeout is recorded as sent — once — instead of being retried into a duplicate', () => {
+  clear();
+  const queued = enqueue({ project: 'store', event: 'delivered', recipient: '963900000300', payload: { order: '1' } });
+  const id = (queued as { id: number }).id;
+  assert.equal(markSentIfStillPending(id, 'whatsapp', 0), true);
+  assert.equal(rowOf(id).status, 'sent');
+  assert.equal(markSentIfStillPending(id, 'whatsapp', 0), false, 'already recorded — a no-op');
+
+  const other = enqueue({ project: 'store', event: 'delivered', recipient: '963900000301', payload: { order: '1' } });
+  const otherId = (other as { id: number }).id;
+  markSent(otherId, 'whatsapp', 0); // a retry got there first
+  assert.equal(markSentIfStillPending(otherId, 'whatsapp', 1), false);
 });
 
 // resolveChannel() routes to Baileys' onWhatsApp(), which has no timeout of

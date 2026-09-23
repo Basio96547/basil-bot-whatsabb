@@ -45,9 +45,17 @@ function requireEnv(name: string): string {
 // triggers and `Number('')` silently evaluates to 0. A blank
 // SEND_BATCH_SIZE or SEND_MIN_DELAY_MS this way doesn't throw anywhere; it
 // just quietly zeroes a limit that was supposed to have a sane default.
+//
+// A value that is present but not a number is refused outright: Number('abc')
+// is NaN, and NaN compares false against everything — SEND_MAX_PER_HOUR=abc
+// silently stopped every WhatsApp send forever (`used < NaN`), and
+// QUEUE_MAX_PENDING=abc silently removed the queue's cap (`pending >= NaN`).
 function numberEnv(name: string, fallback: number): number {
   const raw = process.env[name];
-  return raw === undefined || raw === '' ? fallback : Number(raw);
+  if (raw === undefined || raw.trim() === '') return fallback;
+  const value = Number(raw);
+  if (!Number.isFinite(value)) throw new Error(`Env var ${name} must be a number, got "${raw}"`);
+  return value;
 }
 
 // Same fail-fast contract as requireEnv: a malformed template block stops the
@@ -63,20 +71,58 @@ function requireValidTemplates(projectId: string, templates: TemplateOverrides |
   }
 }
 
+// The numbers in projects.json were trusted as-is. A missing or mistyped one
+// is undefined/NaN at runtime, and every comparison against NaN is false: a
+// missing resendCooldownMinutes switched the cooldown OFF (`elapsed < NaN`),
+// and a missing otpMaxAttempts wrote NULL into a NOT NULL column so every
+// code request for that project failed with a 500. Checked once at boot,
+// like the templates.
+function requireNumber(projectId: string, field: string, value: unknown, min: number): number {
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < min) {
+    throw new Error(`Project "${projectId}": "${field}" must be an integer >= ${min}, got ${JSON.stringify(value)}`);
+  }
+  return value;
+}
+
 function loadProjects(): ProjectConfig[] {
   const raw = readFileSync(path.join(repoRoot, 'config', 'projects.json'), 'utf-8');
   const entries = JSON.parse(raw) as ProjectFileEntry[];
-  return entries.map((entry) => {
+  const loaded = entries.map((entry) => {
+    // The id becomes an env var name and a column value — anything outside
+    // this set cannot be written as PROJECT_API_KEY_<ID> in a .env at all.
+    if (typeof entry.id !== 'string' || !/^[a-z][a-z0-9_]*$/.test(entry.id)) {
+      throw new Error(`Project id ${JSON.stringify(entry.id)} must be lowercase letters, digits and _`);
+    }
+    if (typeof entry.brandName !== 'string' || entry.brandName.trim() === '') {
+      throw new Error(`Project "${entry.id}": "brandName" must be a non-empty string`);
+    }
     const envKey = `PROJECT_API_KEY_${entry.id.toUpperCase()}`;
     requireValidTemplates(entry.id, entry.templates);
     return {
       ...entry,
+      resendCooldownMinutes: requireNumber(entry.id, 'resendCooldownMinutes', entry.resendCooldownMinutes, 0),
+      otpExpiryMinutes: requireNumber(entry.id, 'otpExpiryMinutes', entry.otpExpiryMinutes, 1),
+      otpMaxAttempts: requireNumber(entry.id, 'otpMaxAttempts', entry.otpMaxAttempts, 1),
       // `??` rather than a spread default: an explicit null in the JSON would
       // otherwise slip through as null and disable the cap entirely.
-      otpMaxPerDay: entry.otpMaxPerDay ?? DEFAULT_OTP_MAX_PER_DAY,
+      otpMaxPerDay: requireNumber(entry.id, 'otpMaxPerDay', entry.otpMaxPerDay ?? DEFAULT_OTP_MAX_PER_DAY, 1),
       apiKey: requireEnv(envKey),
     };
   });
+
+  // Keys are looked up in a Map: two projects sharing one key silently
+  // collapsed into whichever was listed last, so one site's requests were
+  // served — codes, quotas, /status — as the other's.
+  const seenIds = new Set<string>();
+  const seenKeys = new Map<string, string>();
+  for (const project of loaded) {
+    if (seenIds.has(project.id)) throw new Error(`Project id "${project.id}" is listed twice in projects.json`);
+    seenIds.add(project.id);
+    const other = seenKeys.get(project.apiKey);
+    if (other) throw new Error(`Projects "${other}" and "${project.id}" have the same API key — each needs its own`);
+    seenKeys.set(project.apiKey, project.id);
+  }
+  return loaded;
 }
 
 const projects = loadProjects();

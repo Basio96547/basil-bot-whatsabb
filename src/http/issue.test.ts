@@ -44,8 +44,15 @@ function counts(): { codes: number; sendLog: number; messages: number } {
 }
 
 /** Exercises the real route helper, not a copy of it. */
-function issue(phone: string): 'queued' | 'already_sent' | 'rejected' {
+function issue(phone: string): 'queued' | 'already_sent' | 'unavailable' | 'rejected' {
   return issueAndQueue(store, phone, 'otp', store.otpExpiryMinutes).kind;
+}
+
+/** Moves every code and message for the test past the resend cooldown. */
+function pastCooldown(): void {
+  const seconds = store.resendCooldownMinutes * 60 + 1;
+  db.exec(`UPDATE otp_codes SET created_at = datetime(created_at, '-${seconds} seconds')`);
+  db.exec(`UPDATE messages SET created_at = datetime(created_at, '-${seconds} seconds')`);
 }
 
 test('a successful issue leaves exactly one code, one quota row and one queued message', () => {
@@ -187,6 +194,90 @@ test('an expired code also falls back to a plain cooldown', () => {
   const outcome = issueAndQueue(store, '963900001012', 'otp', store.otpExpiryMinutes);
   assert.equal(outcome.kind, 'rejected');
   assert.equal(outcome.kind === 'rejected' && outcome.error, 'cooldown');
+});
+
+test('the day\'s last code, still on its way, is reported already_sent — not daily_limit', () => {
+  // A request that succeeded but timed out at the caller may be the day's
+  // last allowed one. Checking the cap first answered "try again tomorrow"
+  // while that very code was arriving.
+  clear();
+  const phone = '963900001030';
+  for (let i = 0; i < store.otpMaxPerDay - 1; i++) {
+    assert.equal(issue(phone), 'queued');
+    db.exec("UPDATE messages SET status = 'failed' WHERE status = 'pending'");
+  }
+  assert.equal(issue(phone), 'queued'); // the 5th — pending, fresh
+  assert.equal(issue(phone), 'already_sent');
+});
+
+test('an outage does not burn the daily allowance: retries supersede each other and only the newest code waits', () => {
+  // Before: every retry past the cooldown queued another code AND charged the
+  // cap — five retries during a WhatsApp drop left the customer locked out
+  // for 24 hours with nothing ever delivered, and when WhatsApp returned all
+  // five stale codes went out at once.
+  clear();
+  const phone = '963900001031';
+  const outcomes: string[] = [];
+  for (let i = 0; i < store.otpMaxPerDay + 3; i++) {
+    outcomes.push(issue(phone));
+    pastCooldown(); // WhatsApp is down: nothing is ever sent
+  }
+  assert.ok(outcomes.every((o) => o === 'queued'), `outcomes: ${outcomes.join(', ')}`);
+
+  const pending = db.prepare(`SELECT COUNT(*) AS n FROM messages WHERE status = 'pending'`).get() as { n: number };
+  assert.equal(pending.n, 1, 'only the newest code is still waiting to go out');
+  const superseded = db
+    .prepare(`SELECT COUNT(*) AS n FROM messages WHERE last_error = 'superseded' AND dropped_unsent = 1`)
+    .get() as { n: number };
+  assert.equal(superseded.n, store.otpMaxPerDay + 2);
+});
+
+test('a genuine delivery attempt that failed still counts against the cap — only never-sent messages are refunded', () => {
+  clear();
+  const phone = '963900001032';
+  for (let i = 0; i < store.otpMaxPerDay; i++) {
+    assert.equal(issue(phone), 'queued');
+    // Five real attempts reached the network and failed (maybe delivered late).
+    db.exec("UPDATE messages SET status = 'failed', attempts = 4, last_error = 'timeout' WHERE status = 'pending'");
+    pastCooldown();
+  }
+  const blocked = issueAndQueue(store, phone, 'otp', store.otpExpiryMinutes);
+  assert.equal(blocked.kind === 'rejected' && blocked.error, 'daily_limit');
+});
+
+test('a code message outlives the code by nothing: it is dropped a margin before the code expires', () => {
+  clear();
+  assert.equal(issue('963900001033'), 'queued');
+  const row = db
+    .prepare(`SELECT (julianday(expires_at) - julianday(created_at)) * 1440 AS minutes FROM messages`)
+    .get() as { minutes: number };
+  assert.ok(row.minutes < store.otpExpiryMinutes, `message lives ${row.minutes} min, code lives ${store.otpExpiryMinutes}`);
+  assert.ok(row.minutes >= 1);
+});
+
+test('during a WhatsApp restriction longer than a code lives, the request is refused honestly and spends nothing', async () => {
+  const { recordEnforcement } = await import('../whatsapp/enforcement.ts');
+  clear();
+  recordEnforcement({ type: 'RESTRICT_ALL_COMPANIONS', endsAtMs: Date.now() + 6 * 60 * 60_000 });
+  try {
+    const outcome = issueAndQueue(store, '963900001034', 'otp', store.otpExpiryMinutes);
+    assert.equal(outcome.kind, 'unavailable');
+    assert.ok(outcome.kind === 'unavailable' && (outcome.retryAfterSeconds ?? 0) > 5 * 60 * 60);
+    assert.deepEqual(counts(), { codes: 0, sendLog: 0, messages: 0 });
+  } finally {
+    db.exec('DELETE FROM account_enforcement');
+  }
+});
+
+test('a restriction ending before the code would expire does not refuse the request', async () => {
+  const { recordEnforcement } = await import('../whatsapp/enforcement.ts');
+  clear();
+  recordEnforcement({ type: 'RESTRICT_ALL_COMPANIONS', endsAtMs: Date.now() + 60_000 });
+  try {
+    assert.equal(issue('963900001035'), 'queued');
+  } finally {
+    db.exec('DELETE FROM account_enforcement');
+  }
 });
 
 test('a throw inside the transaction rolls back too', () => {

@@ -65,26 +65,40 @@ echo "=========================================="
 echo "1) اختبار علم cloudflared قبل الاعتماد عليه"
 # التونيل هو الطريق الوحيد للمتجر إلى هذه الخدمة. علم غير مدعوم في هذه
 # النسخة يعني تونيلاً يفشل عند الإقلاع ومتجراً معطّلاً — فيُختبر أولاً،
-# ويُتراجع عنه تلقائياً بدل أن يُكتشف بعد فوات الأوان.
-if cloudflared tunnel --no-autoupdate --ha-connections 1 run --help >/dev/null 2>&1; then
-  echo "   مدعوم — سيُشغَّل باتصال QUIC واحد بدل أربعة"
+# ويُتراجع عنه تلقائياً بدل أن يُكتشف بعد فوات الأوان. العدد يُقرأ من
+# ecosystem.config.cjs نفسه: الاختبار كان مكتوباً بـ"1" بعد أن صار الملف "2"،
+# فصار الرجوع لا يطابق شيئاً ويفشل بصمت.
+ha=$(grep -o -- '--ha-connections [0-9]*' ecosystem.config.cjs | head -1 | grep -o '[0-9]*$' || true)
+if [ -z "$ha" ]; then
+  echo "   لا يوجد --ha-connections في الملف — لا شيء لاختباره"
+elif cloudflared tunnel --no-autoupdate --ha-connections "$ha" run --help >/dev/null 2>&1; then
+  echo "   مدعوم — سيُشغَّل بـ $ha اتصال QUIC"
 else
   echo "   غير مدعوم في هذه النسخة — التراجع إلى الصيغة القديمة"
-  sed -i "s/tunnel --no-autoupdate --ha-connections 1 run sms-api/tunnel run sms-api/" ecosystem.config.cjs
+  sed -i "s/tunnel --no-autoupdate --ha-connections [0-9]* run sms-api/tunnel run sms-api/" ecosystem.config.cjs
 fi
 
-echo "2) تفريغ السجلات المتراكمة"
+echo "2) مفاتيح المشاريع، وهل يُقلع الإعداد الجديد؟"
+# قبل أي delete: مشروع بلا مفتاحه في .env = خدمة لا تُقلع. إن فشل الفحص
+# نخرج هنا والخدمة الحالية ما زالت تعمل.
+sh scripts/ensure-project-keys.sh
+sh scripts/preflight.sh
+
+echo "3) تفريغ السجلات المتراكمة"
 pm2 flush >/dev/null 2>&1 || true
 
-echo "3) إعادة إنشاء التطبيقات (delete ثم start، لا restart)"
+echo "4) إعادة إنشاء التطبيقات (delete ثم start، لا restart)"
 # pm2 restart لا يقرأ ecosystem.config.cjs المعدَّل أبداً — يحتفظ بالقيم
 # الملتقطة وقت أول تشغيل. لهذا كان سقف الذاكرة القديم يبدو "غير قابل
 # للتعديل"، وهو تحديداً ما نحتاج التأكد من زواله هنا.
-pm2 delete all >/dev/null 2>&1 || true
+#
+# تطبيقات هذا الملف فقط، لا `delete all`: wa-bot-fireworks يعمل على نفس
+# الجوال، و`delete all` ثم `pm2 save` كان يحذفه ويحفظ القائمة بدونه.
+pm2 delete ecosystem.config.cjs >/dev/null 2>&1 || true
 pm2 start ecosystem.config.cjs
 pm2 save >/dev/null
 
-echo "4) انتظار الاستقرار (٣٠ ثانية)"
+echo "5) انتظار الاستقرار (٣٠ ثانية)"
 sleep 30
 
 echo ""
@@ -107,7 +121,7 @@ echo ""
 echo "=========================================="
 echo "=== ما يجب أن تراه                     ==="
 echo "=========================================="
-echo "  * كلا التطبيقين online، وrestarts=0 لكليهما"
+echo "  * sms-api وcloudflared-tunnel وwa-bot-fireworks كلها online، وrestarts=0 للأوّلَين"
 echo "  * الخدمة تردّ بـ whatsapp connected=true"
 echo "  * سقف الذاكرة صار 400MB لا 200MB"
 echo ""

@@ -1,5 +1,14 @@
 import { config, getProjectById } from '../config.ts';
-import { getPendingBatch, markSent, markFailedPermanently, recordFailedAttempt, type MessageRow } from './queue.ts';
+import {
+  getPendingBatch,
+  markSent,
+  markSentIfStillPending,
+  markFailedPermanently,
+  dropUnsent,
+  isStillPending,
+  recordFailedAttempt,
+  type MessageRow,
+} from './queue.ts';
 import { resolveChannel, type Channel } from '../whatsapp/existence.ts';
 import { sendWhatsAppText, getConnectionState } from '../whatsapp/client.ts';
 import { sendSms } from '../sms/provider.ts';
@@ -36,10 +45,13 @@ function randomDelay(): number {
 // guarantee (Baileys' onWhatsApp() has no timeout of its own), and a real
 // SEND_TIMEOUT_MS-length test here would be far too slow for this suite.
 export function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
-  return Promise.race([
-    promise,
-    new Promise<T>((_, reject) => setTimeout(() => reject(new Error('timeout')), ms)),
-  ]);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expiry = new Promise<T>((_, reject) => {
+    timer = setTimeout(() => reject(new Error('timeout')), ms);
+  });
+  // Cleared once the call settles: every message used to leave a 15 s timer
+  // behind, each one a wake-up on a phone that should be asleep.
+  return Promise.race([promise, expiry]).finally(() => clearTimeout(timer));
 }
 
 async function sendViaChannel(channel: Channel, phone: string, text: string): Promise<void> {
@@ -83,36 +95,62 @@ export const defaultGateDeps: WhatsAppGateDeps = {
 export async function processMessage(msg: MessageRow, gateDeps: WhatsAppGateDeps = defaultGateDeps): Promise<boolean> {
   const project = getProjectById(msg.project);
   if (!project) {
-    markFailedPermanently(msg.id, 'unknown_project');
+    dropUnsent(msg.id, 'unknown_project');
     return false;
   }
 
   // Checked before anything else: a message whose deadline passed during an
   // outage is dropped rather than delivered stale (see queue.ts's ttlMinutes).
   if (msg.expires_at && new Date(`${msg.expires_at}Z`).getTime() < Date.now()) {
-    markFailedPermanently(msg.id, 'expired_before_send');
+    dropUnsent(msg.id, 'expired_before_send');
     return false;
   }
 
   const forcedChannel = msg.channel_forced ? (msg.channel as Channel) : undefined;
+  // Read once, used only for this synchronous check. The whatsappBlocked
+  // gate below reads gateDeps.isConnected() again rather than reusing this —
+  // an await (resolveChannel, in the branch below) sits between the two, so
+  // the connection can genuinely change state in between; reusing a stale
+  // value there would be a real bug, not just a missed dedup.
+  const connected = gateDeps.isConnected();
   let channel: Channel;
-  try {
-    // resolveChannel() routes to Baileys' onWhatsApp(), whose own query has
-    // no timeout of its own and can hang for a long time on a bad
-    // connection — unlike every other outbound call on this path
-    // (sendViaChannel below), this await had nothing bounding it, so one
-    // slow/hung lookup could block this whole batch of up to
-    // sendBatchSize messages for minutes.
-    channel = await withTimeout(resolveChannel(msg.recipient, forcedChannel), SEND_TIMEOUT_MS);
-  } catch {
-    recordFailedAttempt(msg.id, msg.channel ?? 'whatsapp', 'channel_resolution_error');
-    return false;
+  if (!forcedChannel && !connected) {
+    // resolveChannel() calls Baileys' onWhatsApp() for any recipient not
+    // already in the existence cache, which needs a live socket. During a
+    // reconnect flap (frequent on this phone's network — plain
+    // "connectionClosed" drops every few minutes) that call either throws
+    // right away or hangs until SEND_TIMEOUT_MS, and either way the catch
+    // below used to burn one of only 5 attempts on a failure that has
+    // nothing to do with this recipient. A handful of those flaps back to
+    // back could exhaust all 5 and permanently fail a message the socket
+    // would have delivered seconds later. Route straight to SMS if it's
+    // configured, otherwise leave the message pending — the same outcome
+    // the whatsappBlocked gate below already gives a message whose channel
+    // WAS resolved, just reached before resolution wastes an attempt on it.
+    if (config.sms.enabled && !isPaused('sms')) {
+      channel = 'sms';
+    } else {
+      return false;
+    }
+  } else {
+    try {
+      // resolveChannel() routes to Baileys' onWhatsApp(), whose own query has
+      // no timeout of its own and can hang for a long time on a bad
+      // connection — unlike every other outbound call on this path
+      // (sendViaChannel below), this await had nothing bounding it, so one
+      // slow/hung lookup could block this whole batch of up to
+      // sendBatchSize messages for minutes.
+      channel = await withTimeout(resolveChannel(msg.recipient, forcedChannel), SEND_TIMEOUT_MS);
+    } catch {
+      recordFailedAttempt(msg.id, msg.channel ?? 'whatsapp', 'channel_resolution_error');
+      return false;
+    }
   }
 
   // Plan 4.6: no WhatsApp on this number and no SMS provider wired yet — this
   // recipient is genuinely unreachable right now, not worth burning retries on.
   if (channel === 'sms' && !config.sms.enabled) {
-    markFailedPermanently(msg.id, 'no_channel_available');
+    dropUnsent(msg.id, 'no_channel_available');
     return false;
   }
 
@@ -165,19 +203,43 @@ export async function processMessage(msg: MessageRow, gateDeps: WhatsAppGateDeps
     // attempts never changed, so getPendingBatch (oldest first) re-selected
     // and re-threw on the exact same row on every single tick, forever —
     // occupying a queue slot with a message that could never succeed or fail.
-    markFailedPermanently(msg.id, `template_render_failed: ${describeError(err)}`);
+    dropUnsent(msg.id, `template_render_failed: ${describeError(err)}`);
     return false;
   }
+
+  // The batch was read before this row's turn came — up to a whole batch of
+  // 3–9 s pacing delays ago. In that time a newer verification code for the
+  // same number may have superseded it (routes.ts), or a late-arriving send
+  // may have completed it. Sending it anyway delivered exactly the stale code
+  // superseding exists to hold back.
+  if (!isStillPending(msg.id)) return false;
 
   let success = false;
   let lastError: string | undefined;
 
+  const firstChannel = channel;
+  const firstSend = sendViaChannel(firstChannel, msg.recipient, text);
   try {
-    await withTimeout(sendViaChannel(channel, msg.recipient, text), SEND_TIMEOUT_MS);
+    await withTimeout(firstSend, SEND_TIMEOUT_MS);
     success = true;
   } catch (err) {
     lastError = describeError(err);
     recordFailure(channel);
+    if (lastError === 'timeout') {
+      // withTimeout stops waiting; it cannot cancel the call. When that call
+      // does complete, the message WAS delivered — recording it keeps the
+      // next retry from delivering it a second time. Nothing to do if it
+      // fails late, or if a retry got there first.
+      firstSend.then(
+        () => {
+          if (markSentIfStillPending(msg.id, firstChannel, variantIndex)) {
+            recordSuccess(firstChannel);
+            console.warn(`[worker] رسالة ${msg.id} وصلت بعد انتهاء المهلة — سُجّلت مُرسَلة بدل إعادة إرسالها`);
+          }
+        },
+        () => {},
+      );
+    }
   }
 
   // Plan 6: auto-routed WhatsApp send failed — try SMS in the same cycle
@@ -259,12 +321,14 @@ async function loop(): Promise<void> {
     // `continue` — so operators still see why WhatsApp sends are stalled
     // without that visibility doubling as the (buggy) gate again.
     const enforcement = activeEnforcement();
+    let rateAllowed = true;
     if (enforcement) {
       console.warn(
         `[worker] حساب واتساب مقيَّد (${enforcement.type}) حتى ${new Date(enforcement.endsAtMs).toISOString()} — الإرسال عبر واتساب متوقف، وSMS غير متأثر`,
       );
     } else {
       const rate = checkSendRate(getConnectionState().pairedAtMs);
+      rateAllowed = rate.allowed;
       if (!rate.allowed) {
         console.warn(
           `[worker] بلغ سقف الإرسال (${rate.used}/${rate.limit} في الساعة${rate.warmingUp ? '، رقم حديث الربط' : ''}) — واتساب متوقف مؤقتاً، وSMS غير متأثر`,
@@ -272,7 +336,15 @@ async function loop(): Promise<void> {
       }
     }
 
-    const batch = getPendingBatch(config.queue.sendBatchSize); // plan 9, point 3
+    // Rows a caller pinned to a channel that cannot send this tick are left
+    // out of the batch, so they cannot fill it and hide the rows behind them
+    // (see getPendingBatch). Only a filter on what is FETCHED — the
+    // per-message gate in processMessage stays the authority on what is sent.
+    const blockedForced: Channel[] = [];
+    if (!getConnectionState().connected || enforcement || !rateAllowed || isPaused('whatsapp')) blockedForced.push('whatsapp');
+    if (!config.sms.enabled || isPaused('sms')) blockedForced.push('sms');
+
+    const batch = getPendingBatch(config.queue.sendBatchSize, blockedForced); // plan 9, point 3
     if (batch.length === 0) {
       await backOff();
       return;

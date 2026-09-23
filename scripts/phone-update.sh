@@ -13,35 +13,30 @@ cd "$(dirname "$0")/.."
 
 echo "=== 1) مفاتيح المشاريع ==="
 # لا يُكتب أي مفتاح داخل هذا الملف — المستودع على GitHub. المفقود يُولَّد هنا
-# ويُطبع مرة واحدة ليُنسخ إلى secret الووركر المقابل.
-ensure_key() {
-  key_name="$1"
-  if grep -q "^${key_name}=" .env 2>/dev/null; then
-    echo "  $key_name موجود — تُرك كما هو"
-  else
-    value=$(node -e "console.log(require('crypto').randomBytes(24).toString('hex'))")
-    printf '%s=%s\n' "$key_name" "$value" >> .env
-    echo "  أُنشئ $key_name — انسخ القيمة التالية إلى secret الووركر:"
-    echo ""
-    echo "      $value"
-    echo ""
-  fi
-}
-ensure_key PROJECT_API_KEY_QAREEB
+# لكل مشروع في config/projects.json (كانت قائمة يدوية نسيت fireworks).
+sh scripts/ensure-project-keys.sh
 
-echo "=== 2) إعادة التشغيل ==="
+echo "=== 2) هل يُقلع الإعداد الجديد؟ ==="
+sh scripts/preflight.sh
+
+echo "=== 3) إعادة التشغيل ==="
 # delete ثم start، لا restart: تغيّر خيارات ecosystem.config.cjs (مثل
 # max_memory_restart) لا يلتقطه pm2 restart — يبقى على القيم المحفوظة وقت
 # أول تشغيل، وهو ما جعل حدّ الذاكرة القديم يبدو "غير قابل للتعديل".
-pm2 delete all 2>/dev/null || true
+#
+# `delete ecosystem.config.cjs` لا `delete all`: على هذا الجوال تطبيق ثالث
+# (wa-bot-fireworks) ليس في هذا الملف. `delete all` كان يحذفه، ثم `pm2 save`
+# يحفظ القائمة بدونه — فيبقى البوت ميتاً حتى يلتقطه الـwatchdog، ولا يعود
+# بعد إعادة إقلاع الجوال.
+pm2 delete ecosystem.config.cjs 2>/dev/null || true
 pm2 start ecosystem.config.cjs
 pm2 save
 
-echo "=== 3) انتظار الإقلاع ==="
+echo "=== 4) انتظار الإقلاع ==="
 sleep 15
 pm2 status
 
-echo "=== 4) الفحص المحلي ==="
+echo "=== 5) الفحص المحلي ==="
 key=$(grep '^PROJECT_API_KEY_STORE=' .env | cut -d= -f2-)
 # `|| true` لأن `set -e` أعلاه كان سيوقف السكربت قبل طباعة النتيجة لو ردّ
 # curl بخطأ — وهي بالضبط الحالة التي نحتاج أن نراها فيها.

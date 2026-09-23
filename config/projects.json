@@ -2,14 +2,14 @@
   {
     "id": "store",
     "brandName": "Talisham",
-    "resendCooldownMinutes": 10,
+    "resendCooldownMinutes": 1,
     "otpExpiryMinutes": 10,
     "otpMaxAttempts": 5,
     "otpMaxPerDay": 5
   },
   {
     "id": "qareeb",
-    "brandName": "Qareeb",
+    "brandName": "مخدم",
     "resendCooldownMinutes": 2,
     "otpExpiryMinutes": 10,
     "otpMaxAttempts": 5,

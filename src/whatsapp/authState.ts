@@ -47,29 +47,18 @@ function withLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
   return next;
 }
 
-async function writeAtomic(filePath: string, contents: string): Promise<void> {
-  const tmpPath = `${filePath}.tmp`;
-  const handle = await open(tmpPath, 'w');
+/**
+ * Flushes a directory's own entries — which names exist and what they point
+ * at. rename() is atomic for concurrent READERS, but durability across a
+ * power cut also needs this, or a file's contents can be on disk while its
+ * name still points at the old version (or nowhere).
+ *
+ * Best-effort: some platforms refuse to open a directory for fsync (Windows
+ * in particular), and there the write is still no worse than before.
+ */
+export async function syncDirectory(dirPath: string): Promise<void> {
   try {
-    await handle.writeFile(contents, 'utf-8');
-    // Without this the rename can land before the data does, which on a
-    // power cut is exactly the torn file this whole function exists to avoid.
-    await handle.sync();
-  } finally {
-    await handle.close();
-  }
-  await rename(tmpPath, filePath);
-
-  // rename() is atomic for concurrent READERS, but durability across a power
-  // cut also needs the directory entry itself flushed — otherwise the file's
-  // contents are on disk while the name still points at the old version (or
-  // nowhere), leaving a stray .tmp behind. That is the crash case the header
-  // cites as this function's whole reason to exist.
-  //
-  // Best-effort: some platforms refuse to open a directory for fsync (Windows
-  // in particular), and there the write is still no worse than before.
-  try {
-    const dir = await open(path.dirname(filePath), 'r');
+    const dir = await open(dirPath, 'r');
     try {
       await dir.sync();
     } finally {
@@ -78,6 +67,31 @@ async function writeAtomic(filePath: string, contents: string): Promise<void> {
   } catch {
     /* directory fsync unsupported here — nothing further to do */
   }
+}
+
+/**
+ * Temp file + fsync + rename: a reader sees the whole old file or the whole
+ * new one, never a torn one. `syncDir: false` is for callers writing many
+ * files into one directory in a burst (a session restore) — they call
+ * syncDirectory() once at the end instead of once per file.
+ */
+export async function writeAtomic(
+  filePath: string,
+  contents: string | Buffer,
+  options: { syncDir?: boolean } = {},
+): Promise<void> {
+  const tmpPath = `${filePath}.tmp`;
+  const handle = await open(tmpPath, 'w');
+  try {
+    await handle.writeFile(contents);
+    // Without this the rename can land before the data does, which on a
+    // power cut is exactly the torn file this whole function exists to avoid.
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  await rename(tmpPath, filePath);
+  if (options.syncDir !== false) await syncDirectory(path.dirname(filePath));
 }
 
 export type CredsProbe = 'ok' | 'missing' | 'corrupt' | 'unreadable';
@@ -140,7 +154,29 @@ export async function useAtomicMultiFileAuthState(folder: string): Promise<Atomi
     });
   };
 
-  const creds: AuthenticationCreds = (await readData('creds.json')) || initAuthCreds();
+  // NOT readData(): that swallows every error into null, and null here means
+  // "mint a brand-new identity", which the first creds.update then writes over
+  // the real session. probeCreds() only narrows that window — creds.json can
+  // still turn momentarily unreadable (EMFILE, EBUSY) between the probe and
+  // this read. Only a genuinely absent file starts fresh; any other read error
+  // throws, and connectWhatsApp's retry-with-backoff tries again later. A
+  // corrupt file still starts fresh, as before: prepareSession has already
+  // tried every backup by the time we get here.
+  const credsPath = path.join(folder, 'creds.json');
+  const creds: AuthenticationCreds = await withLock(credsPath, async () => {
+    let raw: string;
+    try {
+      raw = await readFile(credsPath, { encoding: 'utf-8' });
+    } catch (error) {
+      if ((error as { code?: string }).code === 'ENOENT') return initAuthCreds();
+      throw error;
+    }
+    try {
+      return (JSON.parse(raw, BufferJSON.reviver) as AuthenticationCreds | null) || initAuthCreds();
+    } catch {
+      return initAuthCreds();
+    }
+  });
 
   return {
     state: {
