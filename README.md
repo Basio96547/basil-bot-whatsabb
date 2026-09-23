@@ -87,10 +87,20 @@ pm2 save          # ضروري — بدونه pm2 resurrect (بسكربت الإ
 الذاكرة، وسائط cloudflared) يحتاج:
 
 ```bash
-pm2 delete all && pm2 start ecosystem.config.cjs && pm2 save
+pm2 delete ecosystem.config.cjs && pm2 start ecosystem.config.cjs && pm2 save
 ```
 
 هذا سبب معقول لظنّ أن خياراً ما "لا يتغيّر" مهما عُدِّل.
+
+**لا تستعمل `pm2 delete all`** على هذا الجوال: بوت متجر الألعاب النارية
+(`wa-bot-fireworks`) يعمل بجانب الخدمة وليس في هذا الملف. `delete all` ثم
+`pm2 save` يحذفه ويحفظ القائمة بدونه، فلا يعود حتى بعد إعادة الإقلاع.
+`delete ecosystem.config.cjs` يحذف تطبيقات هذا الملف وحدها.
+
+`scripts/phone-update.sh` و`scripts/phone-cooldown.sh` يفعلان هذا كله، وقبله
+يولّدان أي مفتاح `PROJECT_API_KEY_*` ناقص لكل مشروع في `projects.json`، ثم
+يتأكدان أن الإعداد الجديد يُقلع (`scripts/preflight.sh`) **قبل** إيقاف الخدمة
+الحيّة — إعداد لا يُقلع كان يعني حلقة انهيار وتوقّف التحقق لكل المواقع.
 
 ## 4.1) إذا سخن الجوال
 
@@ -115,7 +125,11 @@ powershell -File "C:\Users\PC\sms api\scripts\push-to-phone.ps1"
 - مهلة المباعدة بين الرسائل تُدفع فقط مقابل إرسال حقيقي، لا مقابل صفوف
   متخطّاة أثناء انقطاع.
 - `--max-old-space-size=256` يجعل V8 يكنس قبل أن يصطدم بسقف pm2 بدل أن يصطدم.
-- cloudflared باتصال QUIC واحد بدل أربعة، وبلا فحص تحديث دوري.
+- cloudflared باتصالَي QUIC بدل أربعة (واحد وحده كان يُسقط النفق كله مع كل
+  انقطاع قصير)، وبلا فحص تحديث دوري.
+- النسخة الاحتياطية المحلية للجلسة ملف واحد مضغوط مشفّر يُبنى بلا حجب، لا
+  نسخاً متزامناً لـ~7500 ملف — تلك كانت تجمّد العملية ~22 ثانية بعد كل إعادة
+  اتصال (مقيسة على الكمبيوتر).
 
 وما يخفضها خارج الكود، وهو الأثر الأكبر ولا يمكن أتمتته: **الإعدادات ←
 البطارية ← حماية البطارية ← حدّ أقصى ٨٠٪**. جوال واقف على ١٠٠٪ وموصول
@@ -128,9 +142,10 @@ powershell -File "C:\Users\PC\sms api\scripts\push-to-phone.ps1"
 
 | Endpoint | الوصف |
 |---|---|
-| `POST /notify` | `{ event, to, payload?, channel? }` — event من: `order_created`, `order_confirmed`, `out_for_delivery`, `delivered`. يرجع `202 { id, status: "queued" }` أو `429` لو الطابور ممتلئ |
-| `POST /otp/request` | `{ to }` — يولّد ويرسل كود تحقق. `429` مع `retryAfterSeconds` لو داخل فترة التهدئة (10 دقائق) |
-| `POST /otp/verify` | `{ to, code }` — `200 { ok:true }` أو `400` مع سبب (`invalid_code`, `too_many_attempts`, `not_found_or_expired`) |
+| `POST /notify` | `{ event, to, payload?, channel? }` — event من: `order_created`, `order_confirmed`, `out_for_delivery`, `delivered`. يرجع `202 { id, status: "queued" }`، أو `400` (`unknown_event`، `invalid_recipient_format`، `invalid_channel`، `channel_unavailable` لـ`sms` بلا مزوّد، `invalid_payload` لقيمة ليست نصاً ولا رقماً، `missing_placeholders` — والنص الفارغ يُعدّ ناقصاً)، أو `429` لو الطابور ممتلئ |
+| `POST /otp/request` | `{ to }` — يولّد ويرسل كود تحقق. `202 { id }` عند الإرسال؛ `202 { alreadySent: true, expiresInSeconds }` لو في كود حيّ لم يُستعمل (نجاح: الكود في الطريق)؛ `429` مع `retryAfterSeconds` لـ`cooldown` (التهدئة لكل مشروع في `projects.json`) أو `daily_limit` (5 رموز مُرسَلة فعلاً لكل رقم في 24 ساعة — ما أُسقط دون إرسال لا يُحسب)؛ `503 delivery_unavailable` حين يستحيل التسليم لساعات (واتساب مسجَّل الخروج أو مقيَّد) — بلا إصدار كود ولا خصم من الحصة |
+| `POST /otp/verify` | `{ to, code }` — `200 { ok:true }` أو `400` مع سبب (`invalid_code`, `too_many_attempts`, `not_found_or_expired`). الكود يُقبل بالأرقام العربية، ومن رسالة واتساب ملصوقة كاملة |
+| `POST /password-reset/request` · `/verify` · `/validate-token` | مثل `/otp/*` لكن في سلّة منفصلة (تهدئة وحصة ورموز مستقلة). `/verify` يرجع `resetToken`، و`/validate-token` **يستهلكه** ويرجع الرقم |
 | `GET /status/:id` | حالة رسالة معيّنة (`pending`/`sent`/`failed`) |
 | `GET /health` | حالة اتصال واتساب + حجم الطابور — `503` لو "degraded" (بند 9، نقطة 7) |
 
@@ -159,9 +174,9 @@ powershell -File "C:\Users\PC\sms api\scripts\push-to-phone.ps1"
 - المتغيّرات المسموحة لكل حدث = نفس متغيّرات قالبه الافتراضي + `{brand}` و `{expiryMinutes}` دائماً
 - قوالب `otp` و `password_reset` لازم تحتوي `{code}`
 
-**حالياً مسجَّل موقعان:** `store` (Talisham، بالقوالب الافتراضية) و `qareeb` (بقوالب تحقق خاصة به، وتهدئة إعادة إرسال أقصر ومهلة صلاحية أطول لأن التسجيل يحصل بلحظتها).
+**حالياً مسجَّلة ثلاثة مشاريع:** `store` (Talisham، بالقوالب الافتراضية)، و`qareeb` — المعرّف القديم لموقع khidam.com، واسمه في الرسائل «مخدم» كما يسمّي الموقع نفسه (كان "Qareeb"، اسماً لم يعد موجوداً في أي مكان)؛ يستعمل مفتاحه تطبيق mokhdam-app الذي يخدم khidam.com الآن — و`fireworks` (مسجَّل ولا يستدعي الخدمة بعد؛ للمتجر بوته الخاص).
 
-> بعد أي تعديل هنا: على الجوال اسحب التحديث، أضف المفتاح الجديد لـ `.env` هناك أيضاً، ثم `pm2 restart sms-api`.
+> بعد أي تعديل هنا: شغّل `scripts/push-to-phone.ps1` من الكمبيوتر (مجلد الجوال ليس مستودع git). المفتاح الناقص لأي مشروع يُولَّد هناك تلقائياً، والإعداد يُفحص قبل إيقاف الخدمة الحيّة.
 
 ## 7) لاحقاً: ربط مزوّد SMS حقيقي
 
@@ -204,8 +219,15 @@ powershell -File "C:\Users\PC\sms api\scripts\push-to-phone.ps1"
 | `whatsapp_disconnected` | مقطوع مؤقتاً — يعيد المحاولة وحده |
 | `session_restored_from_backup` | استُعيدت من R2 ولم تتصل بعد (لوحده لا يُعتبر تدهوراً) |
 | `queue_near_capacity` | الطابور تجاوز 80% من `QUEUE_MAX_PENDING` |
+| `queue_stalled` | أقدم رسالة معلّقة تجاوزت 10 دقائق — الإرسال متوقف فعلاً |
+| `account_restricted` | واتساب أعلن قيداً على الحساب — لا تمسح QR قبل انتهائه (الخدمة لا تعرض QR أثناءه أصلاً) |
+| `send_rate_ceiling` | بلغ سقف الإرسال بالساعة — الرسائل تنتظر ولا تُسقَط |
+| `channel_paused` | قناة موقوفة مؤقتاً بعد فشل متتالٍ (قاطع الدائرة) |
 
-يستعلمه ووركر Qareeb كل 5 دقائق عبر Cron Trigger ويدفع إشعار Web Push للمشرفين **عند تغيّر الحالة فقط** — راجع `src/lib/healthMonitor.ts` هناك.
+`whatsapp_needs_reauth` صار يعني فعلاً «يحتاج QR»: كان يظهر مع كل إعادة اتصال
+عادية لأن الفحص قرأ `creds.registered` — وBaileys لا يضبطه إلا لربط بكود لا بـQR.
+
+كان يستعلمه ووركر `khidam` كل 5 دقائق عبر Cron Trigger ويدفع إشعار Web Push للمشرفين **عند تغيّر الحالة فقط** (`src/lib/healthMonitor.ts` في مستودع khidam.com). **ذلك الووركر حُذف في 2026-09-20** حين انتقل النطاق khidam.com إلى mokhdam-app (تحقّقتُ: `wrangler deployments list --name khidam` → "This Worker does not exist")، فلا شيء يراقب هذه الخدمة الآن إلا إن نُقل المراقب إلى ووركر حيّ.
 
 ## 10) الاختبارات
 
