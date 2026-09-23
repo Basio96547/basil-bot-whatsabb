@@ -96,6 +96,31 @@ const markAllVerified = db.prepare(`
   UPDATE otp_codes SET verified_at = datetime('now')
   WHERE project = ? AND phone = ? AND purpose = ? AND verified_at IS NULL
 `);
+const markMatched = db.prepare(`UPDATE otp_codes SET matched_at = datetime('now') WHERE id = ?`);
+
+// A verification whose RESPONSE was lost is still a verification. The sites
+// give up after 8 s; this phone's link stalls for longer than that, so the
+// request lands, the code is spent, the answer never arrives — and the
+// customer's retry of the very same, correct code was told "expired", with
+// no way forward but waiting out the cooldown for a new one (seen live on
+// khidam.com, 2026-09-23 18:10). For a short window the code that was
+// actually used keeps verifying. Only that code (not its siblings), and each
+// retry still spends one of its attempts, so it is no brute-force window.
+const LOST_RESPONSE_GRACE_SECONDS = 120;
+const selectJustMatched = db.prepare(`
+  SELECT id, code_hash FROM otp_codes
+  WHERE project = ? AND phone = ? AND purpose = ?
+    AND matched_at > datetime('now', '-${LOST_RESPONSE_GRACE_SECONDS} seconds')
+    AND expires_at > datetime('now') AND attempts < max_attempts
+  ORDER BY matched_at DESC, id DESC LIMIT 1
+`);
+const bumpMatchedAttempts = db.prepare(`UPDATE otp_codes SET attempts = attempts + 1 WHERE id = ? AND attempts < max_attempts`);
+
+function hashesEqual(a: string, b: string): boolean {
+  const left = Buffer.from(a);
+  const right = Buffer.from(b);
+  return left.length === right.length && crypto.timingSafeEqual(left, right);
+}
 
 /**
  * What the customer typed, as the six digits it most plausibly means.
@@ -263,9 +288,18 @@ export type VerifyResult =
 
 type LiveCode = { id: number; code_hash: string; attempts: number; max_attempts: number };
 
+function verifyJustMatched(project: ProjectConfig, phone: string, submittedCode: string, purpose: string): VerifyResult {
+  const row = selectJustMatched.get(project.id, phone, purpose) as { id: number; code_hash: string } | undefined;
+  const code = normalizeSubmittedCode(submittedCode);
+  if (!row || !/^\d{6}$/.test(code)) return { ok: false, reason: 'not_found_or_expired' };
+  if (Number(bumpMatchedAttempts.run(row.id).changes) !== 1) return { ok: false, reason: 'not_found_or_expired' };
+  // Anything but the code that was used answers exactly like no code at all.
+  return hashesEqual(hashCode(phone, code), row.code_hash) ? { ok: true } : { ok: false, reason: 'not_found_or_expired' };
+}
+
 export function verifyOtp(project: ProjectConfig, phone: string, submittedCode: string, purpose = 'login'): VerifyResult {
   const live = selectLive.all(project.id, phone, purpose) as LiveCode[];
-  if (live.length === 0) return { ok: false, reason: 'not_found_or_expired' };
+  if (live.length === 0) return verifyJustMatched(project, phone, submittedCode, purpose);
 
   // Only codes with guesses left take part. Each guess below is charged to
   // every one of them, so checking one guess against several live codes can
@@ -289,14 +323,12 @@ export function verifyOtp(project: ProjectConfig, phone: string, submittedCode: 
   for (const row of open) charged += Number(bumpAttempts.run(row.id).changes);
   if (charged === 0) return { ok: false, reason: 'too_many_attempts' };
 
-  const submittedHash = Buffer.from(hashCode(phone, code));
-  const matches = open.some((row) => {
-    const storedHash = Buffer.from(row.code_hash);
-    return submittedHash.length === storedHash.length && crypto.timingSafeEqual(submittedHash, storedHash);
-  });
+  const submittedHash = hashCode(phone, code);
+  const matched = open.find((row) => hashesEqual(submittedHash, row.code_hash));
 
-  if (matches) {
+  if (matched) {
     markAllVerified.run(project.id, phone, purpose);
+    markMatched.run(matched.id);
     return { ok: true };
   }
 

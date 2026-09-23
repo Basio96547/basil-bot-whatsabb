@@ -185,3 +185,9 @@ addColumnIfMissing('messages', 'dropped_unsent', 'INTEGER NOT NULL DEFAULT 0');
 // exactly the rows whose message was dropped unsent (see dropped_unsent above).
 // NULL for rows written before this column existed — those keep counting.
 addColumnIfMissing('otp_send_log', 'message_id', 'INTEGER');
+
+// Migration: when THIS code was the one typed in. verified_at is set on every
+// live code for the number at once (one use spends them all), so it cannot say
+// which code was actually used — and only that one may be accepted again
+// during the lost-response grace window in otp.ts.
+addColumnIfMissing('otp_codes', 'matched_at', 'TEXT');

@@ -109,7 +109,12 @@ test('registration: /otp/verify rejects the wrong code and reports attempts rema
   assert.equal(right.status, 200);
   assert.equal(right.json.ok, true);
 
-  // Spent — verifying again must not still say ok.
+  // A retry of the same code right away is the lost-response case — still ok.
+  const retry = await call('POST', '/otp/verify', { body: { to: phone, code } });
+  assert.equal(retry.status, 200);
+
+  // Spent and past the grace — verifying again must not still say ok.
+  db.exec(`UPDATE otp_codes SET matched_at = datetime('now', '-121 seconds')`);
   const again = await call('POST', '/otp/verify', { body: { to: phone, code } });
   assert.equal(again.status, 400);
   assert.equal(again.json.error, 'not_found_or_expired');

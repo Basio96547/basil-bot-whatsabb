@@ -101,15 +101,48 @@ test('the cap is per number', () => {
   assert.equal(generateOtp(store, '963900000006').ok, true);
 });
 
-test('a code still verifies normally under the cap, and only once', () => {
+test('a code still verifies normally under the cap, and a spent one stops working once the lost-response grace is over', () => {
   clear();
   const generated = generateOtp(store, '963900000007');
   assert.equal(generated.ok, true);
   if (!generated.ok) return;
 
   assert.deepEqual(verifyOtp(store, '963900000007', generated.code), { ok: true });
+  db.exec(`UPDATE otp_codes SET matched_at = datetime('now', '-121 seconds')`);
   // Replaying a spent code must not pass.
   assert.equal(verifyOtp(store, '963900000007', generated.code).ok, false);
+});
+
+test('a retry whose first answer was lost still verifies — the same code, within two minutes', () => {
+  // Seen live on khidam.com: the site gave up after 8 s, sms-api had already
+  // spent the code, and the customer's retry of the SAME correct code was
+  // told it had expired.
+  clear();
+  const generated = generateOtp(store, '963900000016');
+  assert.ok(generated.ok);
+  if (!generated.ok) return;
+  assert.equal(verifyOtp(store, '963900000016', generated.code).ok, true); // answer lost in transit
+  assert.equal(verifyOtp(store, '963900000016', toArabicDigits(generated.code)).ok, true, 'the retry');
+});
+
+test('the grace window accepts only the code that was used, answers everything else like no code, and still counts attempts', () => {
+  clear();
+  const phone = '963900000017';
+  const first = generateOtp(store, phone);
+  db.exec(`UPDATE otp_codes SET created_at = datetime('now', '-5 minutes')`);
+  const second = generateOtp(store, phone);
+  assert.ok(first.ok && second.ok);
+  if (!first.ok || !second.ok) return;
+
+  assert.equal(verifyOtp(store, phone, second.code).ok, true);
+  // The sibling code was spent by that success and is NOT covered by the grace.
+  assert.deepEqual(verifyOtp(store, phone, first.code), { ok: false, reason: 'not_found_or_expired' });
+
+  const wrong = ['000000', '111111', '222222'].find((c) => c !== first.code && c !== second.code)!;
+  for (let i = 0; i < store.otpMaxAttempts; i++) verifyOtp(store, phone, wrong);
+  // Guesses during the grace spend the used code's attempts; once they are
+  // gone, not even the right code reopens it.
+  assert.equal(verifyOtp(store, phone, second.code).ok, false);
 });
 
 test('a wrong code is rejected and counts against the attempt limit', () => {
