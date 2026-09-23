@@ -60,8 +60,12 @@ test('connectWhatsApp aborts BEFORE loading or generating an auth state when cre
 // registered=false, `me` present) was reported as needing re-pairing on every
 // connect and reconnect.
 test('a QR-paired session counts as linked even though Baileys leaves registered=false', () => {
-  assert.equal(isLinkedIdentity({ me: { id: '963900000000:12@s.whatsapp.net', name: 'x' } }), true);
-  assert.equal(isLinkedIdentity({ me: undefined }), false);
+  const me = { id: '963900000000:12@s.whatsapp.net', name: 'x' };
+  const account = {} as NonNullable<Parameters<typeof isLinkedIdentity>[0]['account']>;
+  assert.equal(isLinkedIdentity({ me, account }), true);
+  assert.equal(isLinkedIdentity({ me: undefined, account: undefined }), false);
+  // requestPairingCode() writes `me` before the code is ever entered.
+  assert.equal(isLinkedIdentity({ me, account: undefined }), false);
 });
 
 test('during an active WhatsApp restriction, an unpaired identity is not even offered a QR', async () => {

@@ -57,9 +57,18 @@ const RESTART_REQUIRED_DELAY_MS = 1_000;
 // own once the other copy is gone.
 const CONTESTED_RECONNECT_DELAY_MS = 30 * 60_000;
 
-/** A session that has completed pairing at least once — see connectWhatsApp. */
-export function isLinkedIdentity(creds: Pick<AuthenticationCreds, 'me'>): boolean {
-  return Boolean(creds.me?.id);
+/**
+ * A session that has completed pairing at least once — see connectWhatsApp.
+ *
+ * `me` alone is not proof: Baileys' requestPairingCode() writes creds.me the
+ * moment a pairing CODE is asked for, before anyone enters it. `account` is
+ * written only by configureSuccessfulPairing (validate-connection.js), on a
+ * real pair-success, for both QR and code pairing. This service pairs by QR
+ * only, but the stricter test costs nothing. (Found by the fireworks-bot
+ * session reviewing the same fix, 2026-09-23.)
+ */
+export function isLinkedIdentity(creds: Pick<AuthenticationCreds, 'me' | 'account'>): boolean {
+  return Boolean(creds.me?.id && creds.account);
 }
 
 const NEEDS_QR_SUFFIX = 'يحتاج مسح QR جديد';
