@@ -1,20 +1,11 @@
 import crypto from 'node:crypto';
 import zlib from 'node:zlib';
-import {
-  readdirSync,
-  readFileSync,
-  mkdirSync,
-  renameSync,
-  rmSync,
-  existsSync,
-  openSync,
-  writeSync,
-  fsyncSync,
-  closeSync,
-} from 'node:fs';
+import { readdirSync, readFileSync, renameSync, rmSync, existsSync } from 'node:fs';
+import { readdir, readFile, mkdir, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { S3Client, PutObjectCommand, GetObjectCommand, CopyObjectCommand, DeleteObjectCommand } from '@aws-sdk/client-s3';
 import { config } from '../config.ts';
+import { writeAtomic, syncDirectory } from './authState.ts';
 
 // Plan 8, layer 6: backup of the Baileys auth-state folder, taken on
 // creds.update (not a fixed schedule) so a lost or corrupted session never
@@ -23,19 +14,37 @@ import { config } from '../config.ts';
 //
 // TWO layers, because they fail for different reasons:
 //
-//   1. A plain local copy in `<dataDir>/auth-session-backup`. Needs no
+//   1. A local copy at `<dataDir>/auth-session-backup.enc`. Needs no
 //      credentials at all, so it is always on. Covers the realistic failures:
 //      a torn creds.json, an accidental delete, a bad overwrite.
-//   2. The encrypted copy on R2, when R2 is configured. This is the one that
+//   2. The same bundle on R2, when R2 is configured. This is the one that
 //      survives losing the phone itself — the local copy obviously cannot.
+//
+// Both are ONE file: the encrypted, gzipped bundle below. The local layer used
+// to be a plain copy of the ~7500 session files, written one by one with a
+// synchronous open/write/fsync/rename each — measured at 21.7 s of the event
+// loop frozen solid per snapshot, run 30 s after every WhatsApp reconnect. For
+// all of that time no HTTP request was answered (the sites give up after 8 s)
+// and Baileys' keep-alive could not see its own pongs, so it declared the
+// connection lost (408) — which reconnects, which schedules another snapshot.
+// Now the files are read asynchronously, compressed off the main thread, and
+// written as a single file with a single fsync; the R2 upload reuses the very
+// same bytes instead of reading the session a second time.
 //
 // Restore prefers the local copy: it is newer by definition (written on the
 // same event, without a network round-trip) and cannot fail on a dead tunnel.
 
 const AUTH_DIR = path.join(config.dataDir, 'auth-session');
-const LOCAL_BACKUP_DIR = `${AUTH_DIR}-backup`;
+const LOCAL_BUNDLE = `${AUTH_DIR}-backup.enc`;
+// The previous local format (a directory holding a plain copy of every file).
+// Still restorable, so an upgrade does not strand the copy already on disk;
+// removed by the first snapshot in the new format.
+const LEGACY_BACKUP_DIR = `${AUTH_DIR}-backup`;
 const BACKUP_KEY = 'whatsapp-session.enc';
 const DEBOUNCE_MS = 30_000;
+// Writes during a restore run a few at a time: one by one, 7500 fsyncs took
+// tens of seconds on flash storage; all at once would exhaust file handles.
+const RESTORE_WRITE_CONCURRENCY = 8;
 
 function deriveKey(): Buffer {
   // Lets the operator set any passphrase in .env rather than a raw 32-byte
@@ -43,37 +52,45 @@ function deriveKey(): Buffer {
   return crypto.createHash('sha256').update(config.sessionBackup.encryptionKey).digest();
 }
 
-// Emits the bundle as a stream of JSON fragments instead of building it whole.
-//
-// The old version read all ~7500 session files into one object and
-// JSON.stringify'd it: a ~45 MB string, which the cipher then copied again,
-// and Buffer.concat again — several hundred megabytes of transient allocation
-// against `--max-old-space-size=256`, on a phone whose pm2 ceiling is 400 MB.
-// Every one of those kills forces a full WhatsApp reconnect, which
-// ecosystem.config.cjs calls the single biggest source of heat and the thing
-// that most raises the ban risk on an unofficial client.
-//
-// Now only one file is held at a time; peak retained memory is the compressed
-// ciphertext, which for this session is under a megabyte.
-function* bundleFragments(): Generator<string> {
-  const files = readdirSync(AUTH_DIR).filter((name) => name.endsWith('.json'));
+interface BundleStats {
+  files: number;
+  hasCreds: boolean;
+}
+
+// Emits the bundle as a stream of JSON fragments instead of building it whole,
+// holding one session file at a time — the whole thing is ~45 MB against a
+// 256 MB heap. Reads are asynchronous so the event loop keeps serving between
+// files.
+async function* bundleFragments(stats: BundleStats): AsyncGenerator<string> {
+  const names = (await readdir(AUTH_DIR)).filter((name) => name.endsWith('.json'));
   yield '{';
   let first = true;
-  for (const name of files) {
+  for (const name of names) {
     let contents: string;
     try {
-      contents = readFileSync(path.join(AUTH_DIR, name), 'utf-8');
+      contents = await readFile(path.join(AUTH_DIR, name), 'utf-8');
     } catch {
       continue; // Baileys deletes keys while we work — skip, don't abort
     }
+    if (name === 'creds.json') {
+      // A snapshot is only as good as its creds.json — one that does not
+      // parse must not replace a backup that does.
+      try {
+        JSON.parse(contents);
+        stats.hasCreds = true;
+      } catch {
+        continue;
+      }
+    }
     yield `${first ? '' : ','}${JSON.stringify(name)}:${JSON.stringify(contents)}`;
     first = false;
+    stats.files += 1;
   }
   yield '}';
 }
 
 // Layout: [12-byte IV][16-byte auth tag][ciphertext] — unchanged, so a bundle
-// written by the previous version still decrypts. The PLAINTEXT is now gzipped
+// written by the previous version still decrypts. The PLAINTEXT is gzipped
 // (the session is overwhelmingly repetitive JSON: ~45 MB becomes well under
 // 1 MB), which is detected on the way back out rather than assumed — see
 // decryptBundle.
@@ -91,7 +108,7 @@ export function encryptBundle(plaintext: string): Buffer {
  * — collecting their 'data' events synchronously would have produced an empty
  * backup, which is worse than the memory problem this replaces.
  */
-export async function encryptFragments(fragments: Iterable<string>): Promise<Buffer> {
+export async function encryptFragments(fragments: Iterable<string> | AsyncIterable<string>): Promise<Buffer> {
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv('aes-256-gcm', deriveKey(), iv);
   const gzip = zlib.createGzip();
@@ -103,7 +120,7 @@ export async function encryptFragments(fragments: Iterable<string>): Promise<Buf
     gzip.on('error', reject);
   });
 
-  for (const fragment of fragments) {
+  for await (const fragment of fragments) {
     // Respect backpressure: without this the whole bundle queues inside the
     // gzip stream's buffer and we are back to holding it all in memory.
     if (!gzip.write(fragment)) {
@@ -137,6 +154,31 @@ export function decryptBundle(blob: Buffer): string {
   return plain.toString('utf-8'); // pre-compression bundle
 }
 
+/**
+ * Reads the live session into one encrypted bundle. Throws — writing nothing —
+ * when the live session has no readable creds.json: without it the copy is
+ * worthless and must not replace a good backup.
+ */
+export async function buildSessionBundle(): Promise<{ bundle: Buffer; files: number }> {
+  const stats: BundleStats = { files: 0, hasCreds: false };
+  const bundle = await encryptFragments(bundleFragments(stats));
+  if (!stats.hasCreds) throw new Error('snapshot aborted: creds.json missing from the live session');
+  return { bundle, files: stats.files };
+}
+
+/** The file list inside a decrypted bundle, or null if it holds no usable creds.json. */
+function parseBundle(plaintext: string): Array<[string, string]> | null {
+  const bundle = JSON.parse(plaintext) as Record<string, unknown>;
+  const creds = bundle['creds.json'];
+  if (typeof creds !== 'string') return null;
+  // Verified before anything is overwritten — restoring an unreadable backup
+  // over a merely-damaged session turns a recoverable state into a broken one.
+  JSON.parse(creds);
+  return Object.entries(bundle).filter(
+    (entry): entry is [string, string] => entry[0].endsWith('.json') && typeof entry[1] === 'string',
+  );
+}
+
 let s3Client: S3Client | null = null;
 function getS3(): S3Client {
   if (!s3Client) {
@@ -154,70 +196,15 @@ function getS3(): S3Client {
 
 export { BACKUP_KEY };
 
-async function runBackup(): Promise<void> {
-  const encrypted = await encryptFragments(bundleFragments());
-  await getS3().send(
-    new PutObjectCommand({ Bucket: config.sessionBackup.r2Bucket, Key: BACKUP_KEY, Body: encrypted }),
-  );
-}
-
-// ---- layer 1: local copy (no credentials, always on) ----
-
-// Mirrors authState.ts's writeAtomic's DATA half — same rationale, sync
-// instead of async since every caller here is already synchronous. Before
-// this, the rename could land before the data did: exactly the crash this
-// file's whole staging-dir rework (snapshotLocal) was written to survive,
-// undermined by the one atomic-write primitive that hadn't received the same
-// hardening.
-//
-// Deliberately does NOT also fsync the containing directory on every call —
-// unlike authState.ts's per-key writes (naturally spread over time as
-// messages arrive), the callers below write a live session's ~7500 files in
-// one tight burst. Fsyncing the directory after each one is ~7500 blocking
-// syscalls on the same process that also serves OTP requests, for a
-// guarantee that only needs to hold once the WHOLE burst is done. Callers
-// call fsyncDir() themselves, once, after their loop.
-function writeFileAtomic(filePath: string, contents: string): void {
-  const tmpPath = `${filePath}.tmp`;
-  const fd = openSync(tmpPath, 'w');
-  try {
-    writeSync(fd, contents, null, 'utf-8');
-    fsyncSync(fd);
-  } finally {
-    closeSync(fd);
-  }
-  renameSync(tmpPath, filePath);
-}
-
-// Flushes a directory's own entries (which file names now exist / point
-// where) — durability for the renames above across a power cut needs this
-// too, or the directory could still say "nothing here" (or the old name)
-// even though every file's data already landed. Called ONCE per batch of
-// writeFileAtomic calls into the same directory, not per file — see
-// writeFileAtomic's own comment for why.
-function fsyncDir(dirPath: string): void {
-  // Best-effort: some platforms (Windows in particular) refuse to open a
-  // directory for fsync, and there the writes are still no worse than before.
-  try {
-    const dirFd = openSync(dirPath, 'r');
-    try {
-      fsyncSync(dirFd);
-    } finally {
-      closeSync(dirFd);
-    }
-  } catch {
-    /* directory fsync unsupported here — nothing further to do */
-  }
+async function uploadBundle(bundle: Buffer): Promise<void> {
+  await getS3().send(new PutObjectCommand({ Bucket: config.sessionBackup.r2Bucket, Key: BACKUP_KEY, Body: bundle }));
 }
 
 // Removes any live .json file NOT in `keep` — shared by both restore paths so
 // neither can leave a hybrid of an older identity's leftover keys mixed with
 // a newly-restored one. Copying a backup/bundle *over* the live folder without
 // this kept every key the source didn't contain, producing a session that
-// authenticates and then fails to decrypt (see restoreFromLocal's history —
-// this exact bug, fixed there and not, until now, on the R2 restore path).
-// Exported for testing: a pure filesystem operation, and the one both restore
-// paths below rely on to avoid that bug.
+// authenticates and then fails to decrypt. Exported for testing.
 export function clearStaleAuthFiles(keep: Set<string>): void {
   if (!existsSync(AUTH_DIR)) return;
   for (const name of readdirSync(AUTH_DIR)) {
@@ -227,80 +214,77 @@ export function clearStaleAuthFiles(keep: Set<string>): void {
   }
 }
 
-export function snapshotLocal(): number {
-  // Built in a staging directory and swapped in by rename, NOT written over
-  // the live backup.
-  //
-  // The old order deleted the backup first and then copied ~7500 files in one
-  // by one, so anything that interrupted the copy — pm2's memory kill, the
-  // low-memory killer, a power cut, or simply Baileys unlinking a signal key
-  // mid-copy — left the backup missing or half-written. That is the exact
-  // moment the backup exists for. Worse, restoreFromLocal only checks that
-  // creds.json parses, so a partial snapshot passes validation and gets
-  // restored as a session that authenticates but cannot decrypt.
-  //
-  // Every individual file write in this codebase is already atomic; the
-  // directory replace was the one step that wasn't.
-  const staging = `${LOCAL_BACKUP_DIR}.new`;
-  const previous = `${LOCAL_BACKUP_DIR}.old`;
+/**
+ * Replaces the live session with `files`. creds.json is written LAST: a crash
+ * part-way leaves the old (damaged — that is why we are restoring) creds.json
+ * in place, so the next boot sees it and restores again, instead of a good
+ * creds.json sitting on top of half a key set.
+ */
+async function writeSessionFiles(files: Array<[string, string]>): Promise<void> {
+  await mkdir(AUTH_DIR, { recursive: true });
+  clearStaleAuthFiles(new Set(files.map(([name]) => name)));
 
-  rmSync(staging, { recursive: true, force: true });
-  mkdirSync(staging, { recursive: true });
-
-  const files = readdirSync(AUTH_DIR).filter((name) => name.endsWith('.json'));
-  for (const name of files) {
-    // A key deleted between readdir and readFile is skipped rather than
-    // aborting the whole snapshot — it is gone from the live session anyway.
-    let contents: string;
-    try {
-      contents = readFileSync(path.join(AUTH_DIR, name), 'utf-8');
-    } catch {
-      continue;
+  const keys = files.filter(([name]) => name !== 'creds.json');
+  let next = 0;
+  const writer = async (): Promise<void> => {
+    while (next < keys.length) {
+      const [name, contents] = keys[next++];
+      await writeAtomic(path.join(AUTH_DIR, name), contents, { syncDir: false });
     }
-    writeFileAtomic(path.join(staging, name), contents);
-  }
-  fsyncDir(staging); // one flush for the whole batch, not one per file
+  };
+  await Promise.all(Array.from({ length: Math.min(RESTORE_WRITE_CONCURRENCY, keys.length) }, writer));
+  await syncDirectory(AUTH_DIR); // one flush for the whole batch, not one per file
 
-  // creds.json is what makes a snapshot usable at all; without it the staging
-  // copy is worthless and must not replace a good backup.
-  if (!existsSync(path.join(staging, 'creds.json'))) {
-    rmSync(staging, { recursive: true, force: true });
-    throw new Error('snapshot aborted: creds.json missing from the live session');
-  }
-
-  // Swap: move the current backup aside, promote staging, then drop the old
-  // one. A crash between the renames leaves either the old or the new backup
-  // in place — never a partial directory.
-  rmSync(previous, { recursive: true, force: true });
-  if (existsSync(LOCAL_BACKUP_DIR)) renameSync(LOCAL_BACKUP_DIR, previous);
-  renameSync(staging, LOCAL_BACKUP_DIR);
-  rmSync(previous, { recursive: true, force: true });
-
-  return files.length;
+  const creds = files.find(([name]) => name === 'creds.json');
+  if (creds) await writeAtomic(path.join(AUTH_DIR, 'creds.json'), creds[1]);
 }
 
-export function restoreFromLocal(): { ok: true; files: number } | { ok: false; reason: 'no_backup' | 'error'; error?: unknown } {
-  try {
-    // Verified before anything is overwritten — restoring an unreadable backup
-    // over a merely-damaged session turns a recoverable state into a broken one.
-    JSON.parse(readFileSync(path.join(LOCAL_BACKUP_DIR, 'creds.json'), 'utf-8'));
-  } catch {
-    return { ok: false, reason: 'no_backup' };
+// ---- layer 1: local copy (no credentials, always on) ----
+
+/**
+ * Writes the local backup. `prebuilt` lets the scheduled backup build the
+ * bundle once and hand the same bytes to R2.
+ *
+ * One atomic file replace: a crash at any point leaves either the previous
+ * backup or the new one, never a partial one — the property the old
+ * staging-directory swap existed to provide, now without 7500 writes.
+ */
+export async function snapshotLocal(prebuilt?: { bundle: Buffer; files: number }): Promise<number> {
+  const built = prebuilt ?? (await buildSessionBundle());
+  await writeAtomic(LOCAL_BUNDLE, built.bundle);
+  // The old per-file copy is now strictly older than this bundle. Left in
+  // place it would be what a failed bundle read falls back to.
+  for (const legacy of [LEGACY_BACKUP_DIR, `${LEGACY_BACKUP_DIR}.old`, `${LEGACY_BACKUP_DIR}.new`]) {
+    await rm(legacy, { recursive: true, force: true });
   }
+  return built.files;
+}
 
+async function readLocalBackup(): Promise<Array<[string, string]> | null> {
   try {
-    mkdirSync(AUTH_DIR, { recursive: true });
-    const files = readdirSync(LOCAL_BACKUP_DIR).filter((name) => name.endsWith('.json'));
+    const files = parseBundle(decryptBundle(await readFile(LOCAL_BUNDLE)));
+    if (files) return files;
+  } catch {
+    /* missing, truncated, or a different key — try the older format */
+  }
+  try {
+    JSON.parse(await readFile(path.join(LEGACY_BACKUP_DIR, 'creds.json'), 'utf-8'));
+    const names = (await readdir(LEGACY_BACKUP_DIR)).filter((name) => name.endsWith('.json'));
+    const files: Array<[string, string]> = [];
+    for (const name of names) files.push([name, await readFile(path.join(LEGACY_BACKUP_DIR, name), 'utf-8')]);
+    return files;
+  } catch {
+    return null;
+  }
+}
 
-    // Stale keys in the live folder are removed, not left in place — see
-    // clearStaleAuthFiles's own comment for the hybrid-identity bug this
-    // avoids. snapshotLocal clears its own target for the same reason.
-    clearStaleAuthFiles(new Set(files));
-
-    for (const name of files) {
-      writeFileAtomic(path.join(AUTH_DIR, name), readFileSync(path.join(LOCAL_BACKUP_DIR, name), 'utf-8'));
-    }
-    fsyncDir(AUTH_DIR); // one flush for the whole batch, not one per file
+export async function restoreFromLocal(): Promise<
+  { ok: true; files: number } | { ok: false; reason: 'no_backup' | 'error'; error?: unknown }
+> {
+  const files = await readLocalBackup();
+  if (!files) return { ok: false, reason: 'no_backup' };
+  try {
+    await writeSessionFiles(files);
     return { ok: true, files: files.length };
   } catch (error) {
     return { ok: false, reason: 'error', error };
@@ -332,21 +316,11 @@ export async function restoreSessionFromR2(): Promise<RestoreResult> {
     // Decrypting before touching the auth folder — a wrong
     // SESSION_BACKUP_ENCRYPTION_KEY or a truncated object must fail here,
     // with the existing (possibly still usable) files left untouched.
-    const bundle = JSON.parse(decryptBundle(Buffer.concat(chunks))) as Record<string, string>;
-    const filenames = Object.keys(bundle);
+    const files = parseBundle(decryptBundle(Buffer.concat(chunks)));
+    if (!files) return { ok: false, reason: 'no_backup' };
 
-    mkdirSync(AUTH_DIR, { recursive: true });
-    // Same guard restoreFromLocal already applies: without it, a live folder
-    // left with stale keys from a corrupt/interrupted session (this is the
-    // LAST-RESORT path, only reached once the local restore has already
-    // failed) mixes with the R2 identity into a hybrid that connects and then
-    // fails to decrypt.
-    clearStaleAuthFiles(new Set(filenames));
-    for (const [filename, contents] of Object.entries(bundle)) {
-      writeFileAtomic(path.join(AUTH_DIR, filename), contents);
-    }
-    fsyncDir(AUTH_DIR); // one flush for the whole batch, not one per file
-    return { ok: true, files: filenames.length };
+    await writeSessionFiles(files);
+    return { ok: true, files: files.length };
   } catch (error) {
     const code = (error as { name?: string })?.name;
     if (code === 'NoSuchKey' || code === 'NotFound') return { ok: false, reason: 'no_backup' };
@@ -379,8 +353,8 @@ function timestampSuffix(): string {
 // the half that alone already guarantees the next boot shows a fresh QR
 // (restoreSessionFromR2 only ever runs after both local checks miss).
 export function quarantineLocal(suffix: string): void {
-  for (const dir of [AUTH_DIR, LOCAL_BACKUP_DIR, `${LOCAL_BACKUP_DIR}.old`]) {
-    if (existsSync(dir)) renameSync(dir, `${dir}.${suffix}`);
+  for (const target of [AUTH_DIR, LOCAL_BUNDLE, LEGACY_BACKUP_DIR, `${LEGACY_BACKUP_DIR}.old`]) {
+    if (existsSync(target)) renameSync(target, `${target}.${suffix}`);
   }
 }
 
@@ -452,18 +426,45 @@ let debounceTimer: ReturnType<typeof setTimeout> | null = null;
 // valuable. Past this cap the pending snapshot runs regardless of new events.
 const MAX_DEBOUNCE_MS = 5 * 60_000;
 let firstDeferredAt = 0;
+// A backup now spans many awaits; a second one starting while the first is
+// still reading would race it for the same temp file.
+let backupInFlight = false;
+
+type BackupLogger = { info: (msg: string) => void; error: (msg: string, err: unknown) => void };
+
+async function runSessionBackup(logger: BackupLogger): Promise<void> {
+  let built: { bundle: Buffer; files: number };
+  try {
+    built = await buildSessionBundle();
+  } catch (err) {
+    logger.error('[session-backup] تعذّر بناء النسخة الاحتياطية', err);
+    return;
+  }
+
+  try {
+    await snapshotLocal(built);
+    logger.info(`[session-backup] نسخة محلية: ${built.files} ملف (${Math.ceil(built.bundle.length / 1024)} KB)`);
+  } catch (err) {
+    logger.error('[session-backup] فشلت النسخة المحلية', err);
+  }
+
+  if (!config.sessionBackup.enabled) return;
+  try {
+    await uploadBundle(built.bundle);
+    logger.info('[session-backup] uploaded encrypted session to R2');
+  } catch (err) {
+    logger.error('[session-backup] upload failed, will retry on next change', err);
+  }
+}
 
 /**
  * `isEligible` is the rule that makes this safe to run automatically: a
- * snapshot is only ever taken from a REGISTERED, currently-connected session.
+ * snapshot is only ever taken from a LINKED, currently-connected session.
  * Without it, the first QR-pending boot after a wipe would overwrite the good
  * backup with a blank identity — turning the safety net into the thing that
  * destroys the session.
  */
-export function scheduleSessionBackup(
-  logger: { info: (msg: string) => void; error: (msg: string, err: unknown) => void },
-  isEligible: () => boolean,
-): void {
+export function scheduleSessionBackup(logger: BackupLogger, isEligible: () => boolean): void {
   const now = Date.now();
   if (!debounceTimer) firstDeferredAt = now;
 
@@ -476,18 +477,13 @@ export function scheduleSessionBackup(
     debounceTimer = null;
     firstDeferredAt = 0;
     if (!isEligible()) return;
-
-    try {
-      const files = snapshotLocal();
-      logger.info(`[session-backup] نسخة محلية: ${files} ملف`);
-    } catch (err) {
-      logger.error('[session-backup] فشلت النسخة المحلية', err);
+    if (backupInFlight) {
+      scheduleSessionBackup(logger, isEligible); // try again once this one is done
+      return;
     }
-
-    if (!config.sessionBackup.enabled) return;
-    runBackup().then(
-      () => logger.info('[session-backup] uploaded encrypted session to R2'),
-      (err) => logger.error('[session-backup] upload failed, will retry on next change', err),
-    );
+    backupInFlight = true;
+    void runSessionBackup(logger).finally(() => {
+      backupInFlight = false;
+    });
   }, DEBOUNCE_MS);
 }

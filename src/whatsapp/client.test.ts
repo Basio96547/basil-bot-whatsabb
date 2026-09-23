@@ -27,7 +27,7 @@ process.env.PROJECT_API_KEY_FIREWORKS ??= 'test-fireworks-key';
 process.env.OTP_HASH_SECRET ??= 'test-otp-hash-secret';
 process.env.SESSION_BACKUP_ENCRYPTION_KEY ??= 'test-passphrase-for-backup-roundtrip';
 
-const { prepareSession, connectWhatsApp, getConnectionState } = await import('./client.ts');
+const { prepareSession, connectWhatsApp, getConnectionState, isLinkedIdentity, getSocket } = await import('./client.ts');
 
 const AUTH_DIR = path.join(process.env.DATA_DIR, 'auth-session');
 
@@ -53,4 +53,30 @@ test('connectWhatsApp aborts BEFORE loading or generating an auth state when cre
   // useAtomicMultiFileAuthState, hit the same EISDIR independently, and fall
   // back to a blank identity instead of throwing here.
   await assert.rejects(() => connectWhatsApp(), /تعذّرت قراءته مؤقتاً/);
+});
+
+// The false "needs a QR scan" at every boot: Baileys sets creds.registered
+// only for a pairing-CODE link, so a healthy QR-paired session (this one:
+// registered=false, `me` present) was reported as needing re-pairing on every
+// connect and reconnect.
+test('a QR-paired session counts as linked even though Baileys leaves registered=false', () => {
+  assert.equal(isLinkedIdentity({ me: { id: '963900000000:12@s.whatsapp.net', name: 'x' } }), true);
+  assert.equal(isLinkedIdentity({ me: undefined }), false);
+});
+
+test('during an active WhatsApp restriction, an unpaired identity is not even offered a QR', async () => {
+  const { rmSync } = await import('node:fs');
+  const { recordEnforcement } = await import('./enforcement.ts');
+  const { db } = await import('../db.ts');
+  rmSync(path.join(AUTH_DIR, 'creds.json'), { recursive: true, force: true });
+  recordEnforcement({ type: 'RESTRICT_ALL_COMPANIONS', endsAtMs: Date.now() + 60 * 60_000 });
+  try {
+    await connectWhatsApp(); // must return without opening a socket
+    assert.throws(() => getSocket(), /not initialized/);
+    const state = getConnectionState();
+    assert.equal(state.needsReauth, true);
+    assert.ok(state.sessionNote?.includes('لن يُعرض QR'), state.sessionNote ?? '');
+  } finally {
+    db.exec('DELETE FROM account_enforcement');
+  }
 });

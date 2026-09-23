@@ -2,6 +2,8 @@ import path from 'node:path';
 import makeWASocket, {
   fetchLatestBaileysVersion,
   DisconnectReason,
+  DEFAULT_CONNECTION_CONFIG,
+  type AuthenticationCreds,
   type WASocket,
 } from '@whiskeysockets/baileys';
 import qrcodeTerminal from 'qrcode-terminal';
@@ -38,6 +40,29 @@ const app = { info: (m: string) => console.log(m), error: (m: string, e?: unknow
 const RECONNECT_DELAYS_MS = [5_000, 15_000, 60_000, 180_000, 300_000];
 let reconnectAttempt = 0;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
+// After a QR scan WhatsApp closes the socket with 515 and expects the client
+// to log straight back in with the new credentials. That close used to go
+// through the ordinary backoff — and the QR screens that preceded it had
+// already pushed the counter to its 5-minute ceiling, so a freshly scanned
+// session sat unconnected for up to five minutes.
+const RESTART_REQUIRED_DELAY_MS = 1_000;
+
+// 440: another client took over this same session (the PC dev server holding
+// a copy of data/auth-session did exactly this). 403: WhatsApp refuses the
+// account. Reconnecting on the normal ramp just fights the other client — each
+// connect kicks it, it kicks back — or knocks on a closed door every five
+// minutes; either way, reconnect churn on an unofficial client is itself a
+// ban signal. Retried rarely instead, so the service still comes back on its
+// own once the other copy is gone.
+const CONTESTED_RECONNECT_DELAY_MS = 30 * 60_000;
+
+/** A session that has completed pairing at least once — see connectWhatsApp. */
+export function isLinkedIdentity(creds: Pick<AuthenticationCreds, 'me'>): boolean {
+  return Boolean(creds.me?.id);
+}
+
+const NEEDS_QR_SUFFIX = 'يحتاج مسح QR جديد';
 
 // Bumped for every socket we create. A socket that has been replaced can still
 // emit events (including its own 'close' when we end it), and acting on those
@@ -84,25 +109,45 @@ let socket: WASocket | null = null;
 // يتغيّر بمقياس أسابيع، وتخزينه للأبد كان سيحوّل خدمة تعمل منذ شهر إلى خدمة
 // تُرفض بإصدار قديم دون سبب ظاهر.
 const VERSION_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
-let cachedVersion: Awaited<ReturnType<typeof fetchLatestBaileysVersion>>['version'] | null = null;
-let cachedVersionAt = 0;
+// fetchLatestBaileysVersion() has no timeout of its own — Node's fetch waits
+// up to 300 s for headers — and it reads raw.githubusercontent.com, the kind
+// of GitHub CDN host this phone's network has been seen to stall on for
+// minutes. That wait sat in front of every connect attempt, boot included.
+const VERSION_FETCH_TIMEOUT_MS = 10_000;
+// After a failed fetch, the fallback is reused for a while rather than paying
+// the timeout again on every reconnect of an outage.
+const VERSION_RETRY_AFTER_FAILURE_MS = 30 * 60_000;
+type ProtocolVersion = typeof DEFAULT_CONNECTION_CONFIG.version;
+let cachedVersion: ProtocolVersion | null = null;
+let cachedVersionUntil = 0;
 
-async function getProtocolVersion(): Promise<NonNullable<typeof cachedVersion>> {
-  if (cachedVersion && Date.now() - cachedVersionAt < VERSION_CACHE_TTL_MS) return cachedVersion;
-  try {
-    const { version } = await fetchLatestBaileysVersion();
-    cachedVersion = version;
-    cachedVersionAt = Date.now();
-    return version;
-  } catch (err) {
-    // نسخة قديمة أفضل من لا اتصال: الشبكة تسقط على هذا الجوال بانتظام، وبلا
-    // هذا الرجوع كان فشل هذا النداء وحده يُسقط محاولة الاتصال كلها.
-    if (cachedVersion) {
-      app.error('[whatsapp] تعذّر تحديث إصدار البروتوكول — استُعملت النسخة المحفوظة', err);
-      return cachedVersion;
-    }
-    throw err;
+async function getProtocolVersion(): Promise<ProtocolVersion> {
+  if (cachedVersion && Date.now() < cachedVersionUntil) return cachedVersion;
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const fetched = await Promise.race([
+    fetchLatestBaileysVersion().catch(() => null),
+    new Promise<null>((resolve) => {
+      timer = setTimeout(() => resolve(null), VERSION_FETCH_TIMEOUT_MS);
+    }),
+  ]).finally(() => clearTimeout(timer));
+
+  // Baileys never throws here: on failure it resolves with its own bundled
+  // version plus an `error` — so success has to be read from isLatest, not
+  // from the absence of an exception (the old catch below was dead code, and
+  // a failed fetch was cached as fresh for six hours).
+  if (fetched?.isLatest) {
+    cachedVersion = fetched.version;
+    cachedVersionUntil = Date.now() + VERSION_CACHE_TTL_MS;
+    return fetched.version;
   }
+
+  // نسخة قديمة أفضل من لا اتصال: الشبكة تسقط على هذا الجوال بانتظام.
+  const fallback = cachedVersion ?? fetched?.version ?? DEFAULT_CONNECTION_CONFIG.version;
+  app.error('[whatsapp] تعذّر جلب إصدار البروتوكول الأحدث — استُعملت نسخة محفوظة/افتراضية');
+  cachedVersion = fallback;
+  cachedVersionUntil = Date.now() + VERSION_RETRY_AFTER_FAILURE_MS;
+  return fallback;
 }
 
 export function getSocket(): WASocket {
@@ -112,12 +157,12 @@ export function getSocket(): WASocket {
 
 const authDir = path.join(config.dataDir, 'auth-session');
 
-function scheduleReconnect(): void {
+function scheduleReconnect(delayOverrideMs?: number): void {
   if (reconnectTimer) return; // one chain at a time, however many close events arrive
 
-  const delay = RECONNECT_DELAYS_MS[Math.min(reconnectAttempt, RECONNECT_DELAYS_MS.length - 1)];
-  reconnectAttempt += 1;
-  app.info(`[whatsapp] إعادة محاولة خلال ${delay / 1000}ث`);
+  const delay = delayOverrideMs ?? RECONNECT_DELAYS_MS[Math.min(reconnectAttempt, RECONNECT_DELAYS_MS.length - 1)];
+  if (delayOverrideMs === undefined) reconnectAttempt += 1;
+  app.info(`[whatsapp] إعادة محاولة خلال ${Math.round(delay / 1000)}ث`);
 
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
@@ -130,6 +175,10 @@ function scheduleReconnect(): void {
       scheduleReconnect();
     });
   }, delay);
+  // The HTTP server is what keeps this process alive; a pending reconnect —
+  // which can now be hours away, see the enforcement gate — must not be the
+  // only thing holding it open.
+  reconnectTimer.unref?.();
 }
 
 // Runs before any identity is generated. A missing or corrupt creds.json used
@@ -165,7 +214,7 @@ export async function prepareSession(): Promise<CredsProbe> {
 
   // Local copy first: it needs no credentials, is never staler than the R2
   // one, and can't fail on a dead tunnel.
-  const local = restoreFromLocal();
+  const local = await restoreFromLocal();
   if (local.ok) {
     state.sessionOrigin = 'restored';
     state.sessionNote = `${problem} — استُعيدت ${local.files} ملف من النسخة المحلية`;
@@ -211,15 +260,44 @@ export async function connectWhatsApp(): Promise<void> {
   const { state: authState, saveCreds } = await useAtomicMultiFileAuthState(authDir);
 
   // The authoritative check, and the reason prepareSession doesn't have to be
-  // exactly right: an unregistered identity is one no QR has been scanned for,
-  // whether that's a genuine first run or a session that just died. Retrying
-  // the connection can never fix it, so it's surfaced as needsReauth (503 on
-  // /health) immediately instead of after a first failed connect.
-  if (!authState.creds.registered) {
+  // exactly right: an identity that never completed pairing is one no QR has
+  // been scanned for, whether that's a genuine first run or a session that
+  // just died. Retrying the connection can never fix it, so it's surfaced as
+  // needsReauth (503 on /health) immediately instead of after a first failed
+  // connect.
+  //
+  // `creds.me`, NOT `creds.registered`: Baileys sets `registered` only in the
+  // pairing-CODE flow (messages-recv.js), never for a QR pairing — this
+  // session's creds.json has `registered: false` while perfectly healthy. The
+  // old test therefore flagged "needs a QR scan" on EVERY connect and
+  // reconnect, so /health reported whatsapp_needs_reauth for the whole of any
+  // ordinary outage and the monitor told a human to re-pair a working
+  // session. `me` is what Baileys itself uses to choose between logging in
+  // and registering a new device (socket.js).
+  const linked = isLinkedIdentity(authState.creds);
+  if (!linked) {
     state.sessionOrigin = 'fresh';
     state.needsReauth = true;
-    state.sessionNote = `${state.sessionNote ?? 'الجلسة غير مرتبطة'} — يحتاج مسح QR جديد`;
+    // Set, not appended: this runs on every reconnect of a QR-pending
+    // session, and the note used to grow by one suffix per attempt.
+    if (!state.sessionNote?.includes(NEEDS_QR_SUFFIX)) {
+      state.sessionNote = `${state.sessionNote ?? 'الجلسة غير مرتبطة'} — ${NEEDS_QR_SUFFIX}`;
+    }
     app.error(`[whatsapp] ${state.sessionNote}`);
+
+    // enforcement.ts promises not to let the service be re-paired while
+    // WhatsApp's own restriction is running — scanning a QR then is the one
+    // action most likely to extend it — but nothing enforced that: a restart
+    // during the window put a fresh QR in the log for anyone to scan. A new
+    // pairing is now not even offered until the window ends. An identity that
+    // is already linked is unaffected; it only logs back in.
+    const enforcement = activeEnforcement();
+    if (enforcement) {
+      state.sessionNote = `قيد واتساب نشط (${enforcement.type}) حتى ${new Date(enforcement.endsAtMs).toISOString()} — لن يُعرض QR قبل انتهائه`;
+      app.error(`[whatsapp] ${state.sessionNote}`);
+      scheduleReconnect(Math.max(0, enforcement.endsAtMs - Date.now()) + 60_000);
+      return;
+    }
   }
 
   const version = await getProtocolVersion();
@@ -271,7 +349,12 @@ export async function connectWhatsApp(): Promise<void> {
   const backupEligible = () => state.connected && !state.needsReauth;
 
   socket.ev.on('creds.update', () => {
-    void saveCreds();
+    // A bare `void saveCreds()` turned any write failure — a full disk,
+    // storage permissions, the folder renamed aside by a logout quarantine —
+    // into an unhandled rejection, which ends the process on Node >= 15; pm2
+    // then restarts it and WhatsApp reconnects, and on a full disk that
+    // repeats forever. A failed save is logged; the next update retries it.
+    saveCreds().catch((err) => app.error('[whatsapp] تعذّر حفظ بيانات الجلسة — ستُعاد المحاولة مع التحديث التالي', err));
     scheduleSessionBackup(app, backupEligible);
   });
 
@@ -360,6 +443,24 @@ export async function connectWhatsApp(): Promise<void> {
         // this exact failure with no visible reason why. No reconnect is
         // scheduled here: that stays a human decision, same as before.
         void quarantineDeadSession(app).catch((err) => app.error('[whatsapp] فشل عزل الجلسة الميتة', err));
+        return;
+      }
+
+      if (statusCode === DisconnectReason.restartRequired) {
+        // Expected right after a QR scan — see RESTART_REQUIRED_DELAY_MS.
+        reconnectAttempt = 0;
+        app.info('[whatsapp] واتساب طلب إعادة الاتصال بعد الربط — فوراً');
+        scheduleReconnect(RESTART_REQUIRED_DELAY_MS);
+        return;
+      }
+      if (statusCode === DisconnectReason.connectionReplaced || statusCode === DisconnectReason.forbidden) {
+        state.lastDisconnectReason = statusCode === DisconnectReason.connectionReplaced ? 'connection_replaced' : 'forbidden';
+        app.error(
+          statusCode === DisconnectReason.connectionReplaced
+            ? '[whatsapp] جهاز آخر فتح نفس الجلسة (440) — أوقف النسخة الأخرى. لن نتصارع معها: المحاولة التالية بعد ٣٠ دقيقة'
+            : '[whatsapp] واتساب يرفض هذا الحساب (403) — المحاولة التالية بعد ٣٠ دقيقة',
+        );
+        scheduleReconnect(CONTESTED_RECONNECT_DELAY_MS);
         return;
       }
 
