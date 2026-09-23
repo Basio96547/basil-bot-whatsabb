@@ -66,8 +66,15 @@ const AMBIENT_PLACEHOLDERS = ['brand', 'expiryMinutes'];
 // passed every "is it present" check and then `String(null)` put the literal
 // text "null" into a real customer's message — the same defect class this
 // module exists to prevent, just triggered by null instead of a missing key.
+//
+// An empty or blank string is the same hole in a different shape — an
+// optional form field posted as "" put "شكراً ! طلبك #" in front of a
+// customer — so it counts as absent too, and a variant that does not need
+// the field is chosen instead.
 function hasValue(data: Record<string, unknown>, name: string): boolean {
-  return data[name] !== undefined && data[name] !== null;
+  const value = data[name];
+  if (value === undefined || value === null) return false;
+  return typeof value !== 'string' || value.trim() !== '';
 }
 
 // Checked once at boot (config.ts) rather than at send time — a typo'd

@@ -172,3 +172,16 @@ addColumnIfMissing('messages', 'expires_at', 'TEXT');
 // existed, and already_sent treats that exactly like "unknown, assume fine"
 // (its pre-existing behavior).
 addColumnIfMissing('otp_codes', 'message_id', 'INTEGER');
+
+// Migration: 1 when a message ended 'failed' WITHOUT ever reaching the network
+// (expired while WhatsApp was down, superseded by a newer code, no channel,
+// a template that could not render). The daily OTP cap exists to bound what a
+// number actually RECEIVES; charging it for messages that never left made an
+// ordinary outage lock a customer out for 24 hours — five retries during a
+// WhatsApp drop spent the whole day's allowance with nothing delivered.
+addColumnIfMissing('messages', 'dropped_unsent', 'INTEGER NOT NULL DEFAULT 0');
+
+// Migration: which message a daily-cap row paid for, so the cap can refund
+// exactly the rows whose message was dropped unsent (see dropped_unsent above).
+// NULL for rows written before this column existed — those keep counting.
+addColumnIfMissing('otp_send_log', 'message_id', 'INTEGER');

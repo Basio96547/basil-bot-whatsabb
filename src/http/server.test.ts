@@ -207,6 +207,64 @@ test('/notify rejects a channel that is neither whatsapp nor sms', async () => {
   assert.equal(json.error, 'invalid_channel');
 });
 
+test('/notify refuses a payload value that is not text or a number, instead of delivering "[object Object]"', async () => {
+  clear();
+  const { status, json } = await call('POST', '/notify', {
+    body: { event: 'order_confirmed', to: '963900002052', payload: { order: { id: 5 } } },
+  });
+  assert.equal(status, 400);
+  assert.equal(json.error, 'invalid_payload');
+  assert.deepEqual(json.invalid, ['order']);
+});
+
+test('/notify refuses a payload that is not an object at all', async () => {
+  const { status, json } = await call('POST', '/notify', {
+    body: { event: 'delivered', to: '963900002053', payload: ['104'] },
+  });
+  assert.equal(status, 400);
+  assert.equal(json.error, 'invalid_payload');
+});
+
+test('/notify treats an empty string like a missing field', async () => {
+  clear();
+  // Every out_for_delivery variant needs {amount}; "" must not satisfy it.
+  const { status, json } = await call('POST', '/notify', {
+    body: { event: 'out_for_delivery', to: '963900002054', payload: { order: '105', amount: '  ' } },
+  });
+  assert.equal(status, 400);
+  assert.equal(json.error, 'missing_placeholders');
+});
+
+test('/notify refuses a forced SMS channel when no SMS provider is configured, instead of a 202 that can only fail', async () => {
+  const { status, json } = await call('POST', '/notify', {
+    body: { event: 'delivered', to: '963900002055', payload: { order: '106' }, channel: 'sms' },
+  });
+  assert.equal(status, 400);
+  assert.equal(json.error, 'channel_unavailable');
+});
+
+test('an oversized body is a 413, not a 500 with a stack trace', async () => {
+  const { status, json } = await call('POST', '/notify', { body: { pad: 'x'.repeat(40_000) } });
+  assert.equal(status, 413);
+  assert.equal(json.error, 'payload_too_large');
+});
+
+test('malformed JSON is still a clean 400', async () => {
+  const res = await fetch(`http://127.0.0.1:${port}/notify`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${STORE_KEY}` },
+    body: '{"event":',
+  });
+  assert.equal(res.status, 400);
+  assert.equal(((await res.json()) as { error: string }).error, 'invalid_json_body');
+});
+
+test('the API key is checked before the body is even read', async () => {
+  const { status, json } = await call('POST', '/notify', { apiKey: null, body: { pad: 'x'.repeat(40_000) } });
+  assert.equal(status, 401);
+  assert.equal(json.error, 'invalid_or_missing_api_key');
+});
+
 // Cross-project isolation
 test('/status is scoped to the caller\'s own project — another project\'s key gets 404, not the row', async () => {
   clear();
