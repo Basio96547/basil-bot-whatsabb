@@ -85,6 +85,33 @@ export const defaultGateDeps: WhatsAppGateDeps = {
   checkSendRate,
 };
 
+// رسائل وصلت فعلاً لكن قاعدة البيانات رفضت تسجيلها (قرص ممتلئ). بقاؤها
+// pending كان يعني أن كل نبضة تعيد إرسالها: في اختبار قرص ممتلئ ١٥٠ ثانية
+// استلم كل زبون من أقدم عشرين رسالته ست مرات، ونحو ستين مرة في الساعة لو طال
+// الامتلاء — وسقف الإرسال بالساعة لا يراها لأنه يعدّ صفوف 'sent' وحدها. هنا
+// تُعاد محاولة التسجيل لا الإرسال. في الذاكرة فقط: إعادة تشغيل بينهما تعيد
+// إرسال هذه وحدها مرة واحدة، مثل انهيار بين الإرسال وmarkSent تماماً.
+const deliveredUnrecorded = new Map<number, { channel: Channel; variantIndex: number }>();
+
+function recordDelivered(id: number, channel: Channel, variantIndex: number, onlyIfPending: boolean): boolean {
+  try {
+    if (onlyIfPending) return markSentIfStillPending(id, channel, variantIndex);
+    markSent(id, channel, variantIndex);
+    return true;
+  } catch (err) {
+    deliveredUnrecorded.set(id, { channel, variantIndex });
+    throw err;
+  }
+}
+
+/** ترمي ما دامت قاعدة البيانات ترفض الكتابة. */
+function flushUnrecorded(): void {
+  for (const [id, { channel, variantIndex }] of deliveredUnrecorded) {
+    markSent(id, channel, variantIndex); // وصلت فعلاً — 'sent' صادقة حتى لو تغيّر الصف منذها
+    deliveredUnrecorded.delete(id);
+  }
+}
+
 /**
  * ترجع `true` إذا خرجت محاولة إرسال فعلية إلى الشبكة، و`false` إذا انتهت
  * الرسالة بقرار محلي (مشروع مجهول، انتهت صلاحيتها، القناة موقوفة، واتساب
@@ -93,6 +120,10 @@ export const defaultGateDeps: WhatsAppGateDeps = {
  * في المؤقّتات لكل دفعة أثناء أي انقطاع دون أن تُرسل حرفاً واحداً.
  */
 export async function processMessage(msg: MessageRow, gateDeps: WhatsAppGateDeps = defaultGateDeps): Promise<boolean> {
+  // إرسال سابق ما زال ينتظر تسجيله: القاعدة ترفض الكتابة، فهذا لن يُسجَّل
+  // أيضاً. لا يخرج شيء جديد حتى تنجح runOneTick في تسجيله أولاً.
+  if (deliveredUnrecorded.size > 0) return false;
+
   const project = getProjectById(msg.project);
   if (!project) {
     dropUnsent(msg.id, 'unknown_project');
@@ -232,9 +263,15 @@ export async function processMessage(msg: MessageRow, gateDeps: WhatsAppGateDeps
       // fails late, or if a retry got there first.
       firstSend.then(
         () => {
-          if (markSentIfStillPending(msg.id, firstChannel, variantIndex)) {
-            recordSuccess(firstChannel);
-            console.warn(`[worker] رسالة ${msg.id} وصلت بعد انتهاء المهلة — سُجّلت مُرسَلة بدل إعادة إرسالها`);
+          // A throw here (full disk) would be an unhandled rejection — fatal to
+          // the process. recordDelivered keeps the message from being re-sent.
+          try {
+            if (recordDelivered(msg.id, firstChannel, variantIndex, true)) {
+              recordSuccess(firstChannel);
+              console.warn(`[worker] رسالة ${msg.id} وصلت بعد انتهاء المهلة — سُجّلت مُرسَلة بدل إعادة إرسالها`);
+            }
+          } catch (err) {
+            console.error(`[worker] رسالة ${msg.id} وصلت متأخرة وتعذّر تسجيلها — ستُسجَّل لاحقاً دون إعادة إرسال`, err);
           }
         },
         () => {},
@@ -258,7 +295,11 @@ export async function processMessage(msg: MessageRow, gateDeps: WhatsAppGateDeps
 
   if (success) {
     recordSuccess(channel);
-    markSent(msg.id, channel, variantIndex);
+    try {
+      recordDelivered(msg.id, channel, variantIndex, false);
+    } catch (err) {
+      console.error(`[worker] رسالة ${msg.id} وصلت وتعذّر تسجيلها — ستُسجَّل لاحقاً دون إعادة إرسال`, err);
+    }
     return true;
   }
 
@@ -300,6 +341,10 @@ async function loop(): Promise<void> {
   }
 
   async function runOneTick(): Promise<void> {
+    // تسجيل ما وصل ولم يُسجَّل يسبق أي إرسال جديد. يرمي ما دام القرص ممتلئاً،
+    // فتسجّل الحلقة سطراً واحداً وتتراجع بدل أن تمرّ على الدفعة كلها.
+    flushUnrecorded();
+
     // Nothing can go out at all while the only configured channel is down.
     // Without this the loop would still walk the whole batch just to skip
     // every row. عودة واتساب تستدعي notifyWork() فتقطع هذا الانتظار فوراً.

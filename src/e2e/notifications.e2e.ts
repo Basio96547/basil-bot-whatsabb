@@ -429,6 +429,35 @@ test('كل صيغة من كل قالب في كل مشروع تُعرض نظيف�
   }
 });
 
+test('قرص ممتلئ لحظة تسجيل الإرسال: كل رسالة تصل مرة واحدة فقط، وتُسجَّل sent حين يتحرر', async () => {
+  waState.connected = false;
+  const phones = [phone(), phone(), phone()];
+  const ids: number[] = [];
+  for (const to of phones) {
+    const r = await call('POST', '/notify', KEYS.store, { event: 'delivered', to, payload: ORDER });
+    assert.equal(r.status, 202);
+    ids.push(r.json.id);
+  }
+  // الرسالة تخرج، والسطر الذي يقول إنها خرجت لا يُكتب — كما على قرص ممتلئ
+  db.exec(`CREATE TRIGGER e2e_disk_full BEFORE UPDATE OF status ON messages WHEN NEW.status = 'sent'
+           BEGIN SELECT RAISE(ABORT, 'database or disk is full'); END`);
+  try {
+    waState.connected = true;
+    notifyWork();
+    await new Promise((r) => setTimeout(r, 300));
+    for (let i = 0; i < 5; i++) {
+      notifyWork(); // خمس نبضات إضافية والقرص ما زال ممتلئاً
+      await new Promise((r) => setTimeout(r, 100));
+    }
+  } finally {
+    db.exec('DROP TRIGGER e2e_disk_full');
+  }
+  notifyWork();
+  for (const id of ids) await waitStatus(id, KEYS.store, 'sent');
+  const counts = phones.map((to) => delivered.filter((d) => d.jid === toJid(to)).length);
+  assert.deepEqual(counts, [1, 1, 1], `times each customer received the same message: ${counts}`);
+});
+
 // ───────────── ٦) الأخير: فشل دائم ← قاطع الدائرة ─────────────
 test('فشل دائم: ٥ محاولات ← failed، والقناة تُوقف مؤقتاً ويظهر channel_paused في /health', async () => {
   const to = phone();
