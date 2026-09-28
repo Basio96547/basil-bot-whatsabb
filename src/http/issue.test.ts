@@ -12,6 +12,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import crypto from 'node:crypto';
 
 process.env.DATA_DIR = mkdtempSync(path.join(tmpdir(), 'sms-api-issue-'));
 // config.ts requires one of these per project in config/projects.json at
@@ -331,4 +332,23 @@ test('a refund granted to a superseded code is withdrawn when that code is guess
   db.exec(`UPDATE otp_codes SET code_hash = 'unguessable'`);
   verifyOtp(store, phone, '123456', 'login'); // charged to BOTH live codes
   assert.equal(refundOf(), 0, 'رمز خُمِّن عليه لا يبقى مُسترداً');
+});
+
+test('typing the RIGHT code keeps the refund of a code superseded during an outage — only wrong guesses spend it', () => {
+  clear();
+  const phone = '963900001102';
+  assert.equal(issue(phone), 'queued');
+  const firstMessage = (db.prepare('SELECT MIN(id) AS id FROM messages').get() as { id: number }).id;
+  pastCooldown();
+  const second = issueAndQueue(store, phone, 'otp', store.otpExpiryMinutes);
+  assert.equal(second.kind, 'queued');
+  // The code of the second (live) message, recovered by re-hashing: set a known one.
+  const { createHmac } = crypto;
+  const known = '424242';
+  db.prepare(`UPDATE otp_codes SET code_hash = ? WHERE id = (SELECT MAX(id) FROM otp_codes)`).run(
+    createHmac('sha256', config.otpHashSecret).update(`${phone}:${known}`).digest('hex'),
+  );
+  assert.deepEqual(verifyOtp(store, phone, known, 'login'), { ok: true });
+  const refund = (db.prepare('SELECT dropped_unsent AS d FROM messages WHERE id = ?').get(firstMessage) as { d: number }).d;
+  assert.equal(refund, 1, 'لم يخمّن الزبون شيئاً — الرمز الأول الذي لم يُرسل يبقى مُسترداً');
 });

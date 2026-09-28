@@ -30,7 +30,10 @@ const SEND_TIMEOUT_MS = 15_000; // plan 9, point 5
 // about twelve seconds — and the circuit breaker, which trips at the same
 // count, paused WhatsApp for every project on the very failure that had
 // already killed the message instead of buying it time.
-const RETRY_DELAYS_MS = [30_000, 2 * 60_000, 5 * 60_000, 10 * 60_000];
+//
+// The whole ramp (7.5 min) stays under /health's queue_stalled threshold
+// (10 min): one message working through its retries is not a stalled queue.
+const RETRY_DELAYS_MS = [30_000, 60_000, 2 * 60_000, 4 * 60_000];
 // A WhatsApp lookup that timed out says nothing about the message — it is
 // put back without spending an attempt (see deferMessage).
 const LOOKUP_RETRY_DELAY_MS = 60_000;
@@ -40,7 +43,8 @@ const LOOKUP_RETRY_DELAY_MS = 60_000;
 // stays pending, and the next tick used to pick it straight back up and send
 // it again while the first call was still running — any send slower than
 // about 20 s went out twice. A row in here is skipped until its call settles
-// (or, should it never settle, until UNSETTLED_GIVE_UP_MS has passed).
+// (or, should it never settle, until UNSETTLED_GIVE_UP_MS has passed — kept
+// above client.ts's ACK_GIVE_UP_MS, so a WhatsApp send settles first).
 const unsettled = new Map<number, number>();
 const UNSETTLED_GIVE_UP_MS = 5 * 60_000;
 
@@ -414,10 +418,18 @@ async function loop(): Promise<void> {
   }
 
   async function runOneTick(): Promise<void> {
-    flushUnrecorded();
-    // Before anything that can skip the tick: rows nobody will fetch (pinned
-    // to a blocked channel) must still expire — see expireOverdue.
-    expireOverdue(rowsInFlight());
+    // Housekeeping must not stop the sending. On a full disk both of these
+    // throw — and that is exactly when deliveries still going out (and being
+    // remembered in `unrecorded`) matter; aborting the tick here would stop
+    // every send for as long as the disk stayed full.
+    try {
+      flushUnrecorded();
+      // Before anything that can skip the tick: rows nobody will fetch
+      // (pinned to a blocked channel) must still expire — see expireOverdue.
+      expireOverdue(rowsInFlight());
+    } catch (err) {
+      console.error('[worker] تعذّر تنظيف الطابور في هذه الدورة — الإرسال مستمر', err);
+    }
 
     // Nothing can go out at all while the only configured channel is down.
     // Without this the loop would still walk the whole batch just to skip

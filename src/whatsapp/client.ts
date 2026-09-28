@@ -588,9 +588,15 @@ export class WhatsAppRejectedError extends Error {
   }
 }
 
-// Well inside the worker's own 15 s send timeout on a healthy link; the ack
-// normally arrives in well under a second.
-const ACK_TIMEOUT_MS = 12_000;
+// How long the ack is waited for before the message is given up as not
+// received. It is NOT the send's timeout — the worker bounds that (15 s) and
+// holds the row back while this call is still running, recording it as sent
+// if the ack lands late. waitForMessage's clock starts at registration, i.e.
+// BEFORE sendMessage's own device and pre-key lookups for a new contact, so a
+// short budget here failed sends that had in fact gone out, and the retry
+// delivered a duplicate. A half-open socket still ends this early: its
+// 'close' rejects the wait.
+const ACK_GIVE_UP_MS = 4 * 60_000;
 
 type AckingSocket = Pick<WASocket, 'sendMessage' | 'waitForMessage'> & { user?: { id?: string } };
 
@@ -612,7 +618,7 @@ export async function sendTextAwaitingAck(
   sock: AckingSocket,
   jid: string,
   text: string,
-  ackTimeoutMs = ACK_TIMEOUT_MS,
+  ackTimeoutMs = ACK_GIVE_UP_MS,
 ): Promise<void> {
   const messageId = generateMessageIDV2(sock.user?.id);
   const ack = sock.waitForMessage<BinaryNode>(messageId, ackTimeoutMs);

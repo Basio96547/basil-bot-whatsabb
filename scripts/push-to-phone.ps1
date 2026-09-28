@@ -104,8 +104,13 @@ for ($i = 0; $i -lt 60 -and -not $outcome; $i++) {
     if ($marker -match 'RUNNER (DONE|FAILED)') { $outcome = $Matches[1] }
 }
 
-& $adb pull $logRemote $logLocal 2>$null | Out-Null
-if ($LASTEXITCODE -eq 0) {
+# سجل غائب يجعل adb يكتب على stderr، وتحت 'Stop' يحوّل PowerShell 5.1 ذلك إلى
+# خطأ قاتل قبل أن تصل الرسالة الواضحة أدناه — فالتحقق هنا برمز الخروج وحده.
+$ErrorActionPreference = 'Continue'
+& $adb pull $logRemote $logLocal | Out-Null
+$pulled = $LASTEXITCODE -eq 0
+$ErrorActionPreference = 'Stop'
+if ($pulled) {
     # السجل UTF-8 بلا BOM؛ بلا -Encoding يقرؤه PowerShell 5.1 بترميز ANSI فيتشوّه العربي.
     Get-Content -Encoding UTF8 $logLocal
 } else {

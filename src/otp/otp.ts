@@ -350,7 +350,6 @@ export function verifyOtp(project: ProjectConfig, phone: string, submittedCode: 
   let charged = 0;
   for (const row of open) charged += Number(bumpAttempts.run(row.id).changes);
   if (charged === 0) return { ok: false, reason: 'too_many_attempts' };
-  withdrawRefunds.run(project.id, phone, purpose);
 
   const submittedHash = hashCode(phone, code);
   const matched = open.find((row) => hashesEqual(submittedHash, row.code_hash));
@@ -360,6 +359,12 @@ export function verifyOtp(project: ProjectConfig, phone: string, submittedCode: 
     markMatched.run(matched.id);
     return { ok: true };
   }
+
+  // Only a WRONG guess spends refunds. A right one closes every code for the
+  // number (markAllVerified), so it opens no further guessing — and taking the
+  // refund back then charged a customer who never guessed at all: code A
+  // superseded during an outage, code B typed correctly, A counted anyway.
+  withdrawRefunds.run(project.id, phone, purpose);
 
   return { ok: false, reason: 'invalid_code', attemptsRemaining: newest.max_attempts - newest.attempts - 1 };
 }
