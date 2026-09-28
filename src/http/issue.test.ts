@@ -24,7 +24,7 @@ process.env.OTP_HASH_SECRET ??= 'test-otp-hash-secret';
 process.env.SESSION_BACKUP_ENCRYPTION_KEY ??= 'test-passphrase-for-backup-roundtrip';
 
 const { db, inTransaction } = await import('../db.ts');
-const { generateOtp } = await import('../otp/otp.ts');
+const { generateOtp, verifyOtp } = await import('../otp/otp.ts');
 const { issueAndQueue } = await import('./routes.ts');
 const { getProjectById, config } = await import('../config.ts');
 
@@ -289,4 +289,46 @@ test('a throw inside the transaction rolls back too', () => {
     }),
   );
   assert.deepEqual(counts(), { codes: 0, sendLog: 0, messages: 0 });
+});
+
+// The loop an attacker could run while the worker was merely busy or at its
+// hourly ceiling: five wrong guesses lock the code, a locked code skips the
+// cooldown, and the new code supersedes the old message — which used to
+// refund it from the daily cap. Fresh codes (and five more guesses each)
+// without end, hundreds per second.
+test('guessing a code out and asking again never refills the daily cap — the lock-and-reissue loop is bounded', () => {
+  clear();
+  const phone = '963900001100';
+  let issued = 0;
+  for (let i = 0; i < 50; i++) {
+    const outcome = issueAndQueue(store, phone, 'otp', store.otpExpiryMinutes);
+    if (outcome.kind !== 'queued') {
+      assert.deepEqual(
+        { kind: outcome.kind, error: outcome.kind === 'rejected' ? outcome.error : undefined },
+        { kind: 'rejected', error: 'daily_limit' },
+      );
+      break;
+    }
+    issued += 1;
+    // No guess can match: the test must not depend on a 1-in-a-million hit.
+    db.exec(`UPDATE otp_codes SET code_hash = 'unguessable'`);
+    for (let g = 0; g < store.otpMaxAttempts; g++) verifyOtp(store, phone, '123456', 'login');
+  }
+  assert.equal(issued, store.otpMaxPerDay, 'كل رمز خُمِّن عليه يُحسب من الحصة اليومية');
+});
+
+test('a refund granted to a superseded code is withdrawn when that code is guessed at afterwards', () => {
+  clear();
+  const phone = '963900001101';
+  assert.equal(issue(phone), 'queued');
+  const firstMessage = (db.prepare('SELECT MIN(id) AS id FROM messages').get() as { id: number }).id;
+  pastCooldown();
+  assert.equal(issue(phone), 'queued'); // supersedes the first, never-sent message
+  const refundOf = () =>
+    (db.prepare('SELECT dropped_unsent AS d FROM messages WHERE id = ?').get(firstMessage) as { d: number }).d;
+  assert.equal(refundOf(), 1, 'لم يُرسل ولم يُخمَّن — يُسترد');
+
+  db.exec(`UPDATE otp_codes SET code_hash = 'unguessable'`);
+  verifyOtp(store, phone, '123456', 'login'); // charged to BOTH live codes
+  assert.equal(refundOf(), 0, 'رمز خُمِّن عليه لا يبقى مُسترداً');
 });

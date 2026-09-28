@@ -150,6 +150,32 @@ test('forgot password: verify then validate-token round-trips to the phone the c
   assert.equal(claim.json.phone, phone);
 });
 
+test('forgot password: once a reset token is spent, its siblings die and the code cannot mint another', async () => {
+  // A /verify whose answer was lost is retried inside the grace window, and
+  // each success mints a token. Before: every one of them stayed valid after
+  // the owner's reset, and the same code kept minting more for two minutes —
+  // a second password change waiting for whoever else had seen the code.
+  clear();
+  const project = getProjectById('store')!;
+  const phone = '963900002022';
+  const { code } = generateOtp(project, phone, 'password_reset') as { ok: true; code: string; otpId: number };
+
+  const first = await call('POST', '/password-reset/verify', { body: { to: phone, code } });
+  const retried = await call('POST', '/password-reset/verify', { body: { to: phone, code } });
+  assert.equal(first.status, 200);
+  assert.equal(retried.status, 200, 'the lost-response retry still works before the reset is done');
+
+  const claim = await call('POST', '/password-reset/validate-token', { body: { token: retried.json.resetToken } });
+  assert.equal(claim.status, 200);
+
+  const sibling = await call('POST', '/password-reset/validate-token', { body: { token: first.json.resetToken } });
+  assert.equal(sibling.status, 400, 'the other token from the same code must not reset the password again');
+
+  const replay = await call('POST', '/password-reset/verify', { body: { to: phone, code } });
+  assert.equal(replay.status, 400, 'the reset is done — the code must not mint a new token');
+  assert.equal(replay.json.error, 'not_found_or_expired');
+});
+
 test('forgot password: validate-token rejects a forged token', async () => {
   clear();
   const { status, json } = await call('POST', '/password-reset/validate-token', { body: { token: 'not-a-real-token' } });

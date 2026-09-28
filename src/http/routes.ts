@@ -1,6 +1,6 @@
 import { Router, type Response } from 'express';
 import { enqueue, getStatus, countPending, oldestPendingAgeSeconds, supersedePending } from '../queue/queue.ts';
-import { generateOtp, verifyOtp, linkOtpMessage } from '../otp/otp.ts';
+import { generateOtp, verifyOtp, linkOtpMessage, endVerificationGrace } from '../otp/otp.ts';
 import { issueResetToken, validateResetToken } from '../passwordReset/passwordReset.ts';
 import { getConnectionState } from '../whatsapp/client.ts';
 import { knownEvents, missingPlaceholders } from '../templates/templates.ts';
@@ -291,6 +291,8 @@ router.post('/password-reset/validate-token', (req, res) => {
     res.status(400).json({ error: result.reason });
     return;
   }
+  // The reset is done: the code that opened it must not mint another token.
+  endVerificationGrace(project.id, result.phone, 'password_reset');
   res.status(200).json({ ok: true, phone: result.phone });
 });
 

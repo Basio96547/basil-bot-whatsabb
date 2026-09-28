@@ -118,11 +118,27 @@ const markSentIfPendingStmt = db.prepare(
 const markFailedStmt = db.prepare(
   `UPDATE messages SET status = 'failed', last_error = ?, updated_at = datetime('now') WHERE id = ?`,
 );
+// Whether a message being given up is refunded to its number's daily OTP cap.
+//
 // `attempts = 0` is what makes "never left" true: a row with earlier network
 // attempts behind it may have been delivered by a send that timed out on our
 // side, so it keeps counting.
+//
+// The NOT EXISTS is what keeps the cap a cap. A code that was GUESSED at is
+// charged whether or not its message ever left: without this, five wrong
+// guesses locked the code, which let the next request skip the cooldown,
+// whose new code superseded (and so refunded) the old message — and the loop
+// repeated at hundreds of requests a second with the cap never filling,
+// while the WhatsApp side was merely busy or rate-limited. Every guess is
+// charged to every open code (otp.ts), so this bounds guesses per number per
+// day to otpMaxPerDay × otpMaxAttempts, as the cap always claimed to. otp.ts
+// also withdraws a refund already granted if a guess lands on the code later.
+const REFUNDABLE_IF_DROPPED = `(attempts = 0 AND NOT EXISTS (
+  SELECT 1 FROM otp_codes c WHERE c.message_id = messages.id AND c.attempts > 0
+))`;
+
 const dropUnsentStmt = db.prepare(
-  `UPDATE messages SET status = 'failed', last_error = ?, dropped_unsent = (attempts = 0), updated_at = datetime('now')
+  `UPDATE messages SET status = 'failed', last_error = ?, dropped_unsent = ${REFUNDABLE_IF_DROPPED}, updated_at = datetime('now')
    WHERE id = ? AND status = 'pending'`,
 );
 const recordAttemptStmt = db.prepare(
@@ -164,7 +180,7 @@ export function isStillPending(id: number): boolean {
 }
 
 const supersedeStmt = db.prepare(`
-  UPDATE messages SET status = 'failed', last_error = 'superseded', dropped_unsent = (attempts = 0), updated_at = datetime('now')
+  UPDATE messages SET status = 'failed', last_error = 'superseded', dropped_unsent = ${REFUNDABLE_IF_DROPPED}, updated_at = datetime('now')
   WHERE project = ? AND recipient = ? AND event = ? AND status = 'pending'
 `);
 

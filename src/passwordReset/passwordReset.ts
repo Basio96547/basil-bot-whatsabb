@@ -30,6 +30,16 @@ const claimToken = db.prepare(`
   RETURNING phone
 `);
 
+// A reset that went through ends every other token for the same account. More
+// than one can exist legitimately — a /verify whose response was lost is
+// retried inside otp.ts's grace window, and each success mints a new token —
+// and any of them left alive was a second password change waiting to happen
+// after the owner's own.
+const revokeOthers = db.prepare(`
+  UPDATE reset_tokens SET used_at = datetime('now')
+  WHERE project = ? AND phone = ? AND used_at IS NULL
+`);
+
 export function issueResetToken(project: string, phone: string): string {
   const token = crypto.randomBytes(32).toString('hex');
   const expiresAt = toSqliteUtc(Date.now() + RESET_TOKEN_EXPIRY_MINUTES * 60_000);
@@ -44,5 +54,6 @@ export type ValidateTokenResult =
 export function validateResetToken(project: string, token: string): ValidateTokenResult {
   const row = claimToken.get(project, hashToken(token)) as { phone: string } | undefined;
   if (!row) return { ok: false, reason: 'not_found_or_expired' };
+  revokeOthers.run(project, row.phone);
   return { ok: true, phone: row.phone };
 }
