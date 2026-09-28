@@ -40,6 +40,37 @@ function requireEnv(name: string): string {
   return value;
 }
 
+// The placeholders shipped in .env.example. That file is public on GitHub, so
+// a value still starting with this is a value anyone can read.
+const PLACEHOLDER_PREFIX = 'change-me';
+
+// An API key IS the project's identity: a placeholder one let anyone who has
+// read .env.example send WhatsApp messages from the brand's own number under
+// that project's name. Refused at boot like every other misconfiguration here
+// — scripts/preflight.sh then stops a deploy before the live service is
+// touched.
+function requireApiKey(name: string): string {
+  const value = requireEnv(name);
+  if (value.trim().toLowerCase().startsWith(PLACEHOLDER_PREFIX)) {
+    throw new Error(
+      `${name} is still the placeholder from .env.example — generate a real key (sh scripts/ensure-project-keys.sh after emptying it) and update the site that uses it`,
+    );
+  }
+  return value;
+}
+
+// These two are only warned about, not refused: they never leave the phone
+// (the OTP hash secret only matters if the database itself leaks), and
+// changing the backup key makes the backups already written undecryptable
+// until the next snapshot — not something to force on an unattended deploy.
+function requireSecret(name: string): string {
+  const value = requireEnv(name);
+  if (value.trim().toLowerCase().startsWith(PLACEHOLDER_PREFIX)) {
+    console.warn(`[config] ${name} ما زال القيمة المثالية من .env.example — استبدله بقيمة عشوائية طويلة`);
+  }
+  return value;
+}
+
 // `Number(process.env.X ?? fallback)` only falls back when X is UNSET — an
 // empty string left in .env (`X=`) is not undefined, so `?? fallback` never
 // triggers and `Number('')` silently evaluates to 0. A blank
@@ -50,11 +81,20 @@ function requireEnv(name: string): string {
 // is NaN, and NaN compares false against everything — SEND_MAX_PER_HOUR=abc
 // silently stopped every WhatsApp send forever (`used < NaN`), and
 // QUEUE_MAX_PENDING=abc silently removed the queue's cap (`pending >= NaN`).
-function numberEnv(name: string, fallback: number): number {
+//
+// A number that parses but makes no sense is refused too. SEND_BATCH_SIZE=0
+// fetched `LIMIT 0` rows forever — nothing was ever sent, and nothing said
+// why — and a negative one is `LIMIT -1` in SQLite, i.e. the whole queue
+// loaded into memory at once. Every limit below has a floor that keeps the
+// service actually doing its job.
+export function numberEnv(name: string, fallback: number, bounds: { min?: number; max?: number; integer?: boolean } = {}): number {
   const raw = process.env[name];
   if (raw === undefined || raw.trim() === '') return fallback;
   const value = Number(raw);
   if (!Number.isFinite(value)) throw new Error(`Env var ${name} must be a number, got "${raw}"`);
+  if (bounds.integer && !Number.isInteger(value)) throw new Error(`Env var ${name} must be a whole number, got "${raw}"`);
+  if (bounds.min !== undefined && value < bounds.min) throw new Error(`Env var ${name} must be >= ${bounds.min}, got "${raw}"`);
+  if (bounds.max !== undefined && value > bounds.max) throw new Error(`Env var ${name} must be <= ${bounds.max}, got "${raw}"`);
   return value;
 }
 
@@ -106,7 +146,7 @@ function loadProjects(): ProjectConfig[] {
       // `??` rather than a spread default: an explicit null in the JSON would
       // otherwise slip through as null and disable the cap entirely.
       otpMaxPerDay: requireNumber(entry.id, 'otpMaxPerDay', entry.otpMaxPerDay ?? DEFAULT_OTP_MAX_PER_DAY, 1),
-      apiKey: requireEnv(envKey),
+      apiKey: requireApiKey(envKey),
     };
   });
 
@@ -137,10 +177,22 @@ export function getProjectByApiKey(apiKey: string): ProjectConfig | undefined {
   return projectsByApiKey.get(apiKey);
 }
 
+const sendMinDelayMs = numberEnv('SEND_MIN_DELAY_MS', 3000, { min: 0 });
+const sendMaxDelayMs = numberEnv('SEND_MAX_DELAY_MS', 9000, { min: 0 });
+if (sendMaxDelayMs < sendMinDelayMs) {
+  throw new Error(`SEND_MAX_DELAY_MS (${sendMaxDelayMs}) must be >= SEND_MIN_DELAY_MS (${sendMinDelayMs})`);
+}
+
 export const config = {
-  port: numberEnv('PORT', 3000),
-  dataDir: path.resolve(repoRoot, process.env.DATA_DIR ?? './data'),
-  otpHashSecret: requireEnv('OTP_HASH_SECRET'),
+  port: numberEnv('PORT', 3000, { min: 1, max: 65535, integer: true }),
+  // Loopback only by default: cloudflared reaches the service at
+  // localhost:3000 on the same phone, and nothing else needs to. Listening on
+  // every interface put the API on whatever Wi-Fi the phone joined.
+  host: process.env.HOST || '127.0.0.1',
+  // `||`, not `??`: a blank `DATA_DIR=` is the same trap numberEnv describes —
+  // it resolved to the repo root itself, and the database landed there.
+  dataDir: path.resolve(repoRoot, process.env.DATA_DIR || './data'),
+  otpHashSecret: requireSecret('OTP_HASH_SECRET'),
   whatsappNumber: process.env.WHATSAPP_NUMBER ?? '',
 
   whatsapp: {
@@ -148,7 +200,7 @@ export const config = {
     // radio. Configurable because raising it too far lets the server drop the
     // socket as idle, which costs a reconnect — and reconnect churn on an
     // unofficial client is itself a ban signal.
-    keepAliveIntervalMs: numberEnv('KEEP_ALIVE_INTERVAL_MS', 60_000),
+    keepAliveIntervalMs: numberEnv('KEEP_ALIVE_INTERVAL_MS', 60_000, { min: 1_000, integer: true }),
   },
 
   // Ceiling on TOTAL messages leaving this service, independent of the
@@ -165,16 +217,16 @@ export const config = {
   // stops draining until the window rolls, and short-lived OTPs expire out on
   // their own TTL instead of arriving stale.
   sendRate: {
-    maxPerHour: numberEnv('SEND_MAX_PER_HOUR', 120),
+    maxPerHour: numberEnv('SEND_MAX_PER_HOUR', 120, { min: 1, integer: true }),
     // A freshly paired number is at its most fragile — this is exactly when a
     // re-pair after an enforcement happens. Its first hours run at a fraction
     // of the normal ceiling.
-    warmupHours: numberEnv('SEND_WARMUP_HOURS', 24),
-    warmupMaxPerHour: numberEnv('SEND_WARMUP_MAX_PER_HOUR', 30),
+    warmupHours: numberEnv('SEND_WARMUP_HOURS', 24, { min: 0 }),
+    warmupMaxPerHour: numberEnv('SEND_WARMUP_MAX_PER_HOUR', 30, { min: 1, integer: true }),
   },
 
   sessionBackup: {
-    encryptionKey: requireEnv('SESSION_BACKUP_ENCRYPTION_KEY'),
+    encryptionKey: requireSecret('SESSION_BACKUP_ENCRYPTION_KEY'),
     r2AccountId: process.env.R2_ACCOUNT_ID ?? '',
     r2AccessKeyId: process.env.R2_ACCESS_KEY_ID ?? '',
     r2SecretAccessKey: process.env.R2_SECRET_ACCESS_KEY ?? '',
@@ -194,17 +246,17 @@ export const config = {
   },
 
   queue: {
-    maxPending: numberEnv('QUEUE_MAX_PENDING', 5000),
+    maxPending: numberEnv('QUEUE_MAX_PENDING', 5000, { min: 1, integer: true }),
     // Plan 9 point 2 bounded the AGGREGATE queue, shared by every project on
     // this one WhatsApp number, but nothing bounded what ONE of them could
     // occupy inside it — a leaked or misbehaving API key for a single project
     // could fill the shared queue and starve OTP delivery for every other
     // tenant. Default well below the aggregate cap so no single project can
     // come close to dominating it, while staying far above real traffic.
-    maxPendingPerProject: numberEnv('QUEUE_MAX_PENDING_PER_PROJECT', 1000),
-    sendBatchSize: numberEnv('SEND_BATCH_SIZE', 20),
-    sendMinDelayMs: numberEnv('SEND_MIN_DELAY_MS', 3000),
-    sendMaxDelayMs: numberEnv('SEND_MAX_DELAY_MS', 9000),
+    maxPendingPerProject: numberEnv('QUEUE_MAX_PENDING_PER_PROJECT', 1000, { min: 1, integer: true }),
+    sendBatchSize: numberEnv('SEND_BATCH_SIZE', 20, { min: 1, integer: true }),
+    sendMinDelayMs,
+    sendMaxDelayMs,
   },
 
   projects,

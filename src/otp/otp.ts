@@ -97,6 +97,18 @@ const markAllVerified = db.prepare(`
   WHERE project = ? AND phone = ? AND purpose = ? AND verified_at IS NULL
 `);
 const markMatched = db.prepare(`UPDATE otp_codes SET matched_at = datetime('now') WHERE id = ?`);
+// A guess spends the daily-cap refund of every code it was charged to — see
+// REFUNDABLE_IF_DROPPED in queue.ts. That covers codes dropped BEFORE the
+// guess; this covers the refund granted to a code whose message was dropped
+// (superseded, expired) and that was guessed at only afterwards, while it was
+// still live.
+const withdrawRefunds = db.prepare(`
+  UPDATE messages SET dropped_unsent = 0
+  WHERE dropped_unsent = 1 AND id IN (
+    SELECT message_id FROM otp_codes
+    WHERE project = ? AND phone = ? AND purpose = ? AND attempts > 0 AND message_id IS NOT NULL
+  )
+`);
 
 // A verification whose RESPONSE was lost is still a verification. The sites
 // give up after 8 s; this phone's link stalls for longer than that, so the
@@ -115,6 +127,21 @@ const selectJustMatched = db.prepare(`
   ORDER BY matched_at DESC, id DESC LIMIT 1
 `);
 const bumpMatchedAttempts = db.prepare(`UPDATE otp_codes SET attempts = attempts + 1 WHERE id = ? AND attempts < max_attempts`);
+const clearMatched = db.prepare(`
+  UPDATE otp_codes SET matched_at = NULL
+  WHERE project = ? AND phone = ? AND purpose = ? AND matched_at IS NOT NULL
+`);
+
+/**
+ * Closes the lost-response grace window early, once the flow the code opened
+ * has provably finished. The window exists for a caller that never SAW its
+ * answer; one that went on to use the result (a reset token that was spent)
+ * clearly did, and past that point a replay of the same code is no longer a
+ * retry — it is someone else holding the code, minting a second reset token.
+ */
+export function endVerificationGrace(projectId: string, phone: string, purpose: string): void {
+  clearMatched.run(projectId, phone, purpose);
+}
 
 function hashesEqual(a: string, b: string): boolean {
   const left = Buffer.from(a);
@@ -211,7 +238,8 @@ export function generateOtp(project: ProjectConfig, phone: string, purpose = 'lo
       // dead code, and a plain cooldown left them stuck for the rest of the
       // window. Same reasoning as `undeliverable` — issue a fresh one; the
       // daily cap below still bounds how many codes, and so how many guesses,
-      // a number can get.
+      // a number can get — because a code that was guessed at is never
+      // refunded from that cap (REFUNDABLE_IF_DROPPED in queue.ts).
       const locked = !latest.verified_at && latest.attempts >= latest.max_attempts;
 
       if (!undeliverable && !locked) {
@@ -331,6 +359,12 @@ export function verifyOtp(project: ProjectConfig, phone: string, submittedCode: 
     markMatched.run(matched.id);
     return { ok: true };
   }
+
+  // Only a WRONG guess spends refunds. A right one closes every code for the
+  // number (markAllVerified), so it opens no further guessing — and taking the
+  // refund back then charged a customer who never guessed at all: code A
+  // superseded during an outage, code B typed correctly, A counted anyway.
+  withdrawRefunds.run(project.id, phone, purpose);
 
   return { ok: false, reason: 'invalid_code', attemptsRemaining: newest.max_attempts - newest.attempts - 1 };
 }

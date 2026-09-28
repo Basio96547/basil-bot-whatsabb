@@ -89,6 +89,7 @@ function pendingBatchStmt(excluded: Channel[]): ReturnType<typeof db.prepare> {
       : '';
     stmt = db.prepare(`
       SELECT * FROM messages WHERE status = 'pending' ${exclusion}
+        AND (next_attempt_at IS NULL OR next_attempt_at <= datetime('now'))
       ORDER BY created_at ASC, id ASC LIMIT ?
     `);
     pendingBatchStmts.set(key, stmt);
@@ -115,18 +116,43 @@ const markSentIfPendingStmt = db.prepare(
   `UPDATE messages SET status = 'sent', channel = ?, template_variant = ?, dropped_unsent = 0, updated_at = datetime('now')
    WHERE id = ? AND status = 'pending'`,
 );
+// `status = 'pending'`: a send that timed out and landed later may already
+// have marked the row sent — a failure recorded after that must not overwrite
+// the truth. `attempts + 1` because this IS the last attempt; the column read
+// one short for every message that ran out of them.
 const markFailedStmt = db.prepare(
-  `UPDATE messages SET status = 'failed', last_error = ?, updated_at = datetime('now') WHERE id = ?`,
+  `UPDATE messages SET status = 'failed', attempts = attempts + 1, last_error = ?, updated_at = datetime('now')
+   WHERE id = ? AND status = 'pending'`,
 );
+// Whether a message being given up is refunded to its number's daily OTP cap.
+//
 // `attempts = 0` is what makes "never left" true: a row with earlier network
 // attempts behind it may have been delivered by a send that timed out on our
 // side, so it keeps counting.
+//
+// The NOT EXISTS is what keeps the cap a cap. A code that was GUESSED at is
+// charged whether or not its message ever left: without this, five wrong
+// guesses locked the code, which let the next request skip the cooldown,
+// whose new code superseded (and so refunded) the old message — and the loop
+// repeated at hundreds of requests a second with the cap never filling,
+// while the WhatsApp side was merely busy or rate-limited. Every guess is
+// charged to every open code (otp.ts), so this bounds guesses per number per
+// day to otpMaxPerDay × otpMaxAttempts, as the cap always claimed to. otp.ts
+// also withdraws a refund already granted if a guess lands on the code later.
+const REFUNDABLE_IF_DROPPED = `(attempts = 0 AND NOT EXISTS (
+  SELECT 1 FROM otp_codes c WHERE c.message_id = messages.id AND c.attempts > 0
+))`;
+
 const dropUnsentStmt = db.prepare(
-  `UPDATE messages SET status = 'failed', last_error = ?, dropped_unsent = (attempts = 0), updated_at = datetime('now')
+  `UPDATE messages SET status = 'failed', last_error = ?, dropped_unsent = ${REFUNDABLE_IF_DROPPED}, updated_at = datetime('now')
    WHERE id = ? AND status = 'pending'`,
 );
 const recordAttemptStmt = db.prepare(
-  `UPDATE messages SET attempts = attempts + 1, channel = ?, last_error = ?, updated_at = datetime('now') WHERE id = ?`,
+  `UPDATE messages SET attempts = attempts + 1, channel = ?, last_error = ?, next_attempt_at = ?, updated_at = datetime('now')
+   WHERE id = ? AND status = 'pending'`,
+);
+const deferStmt = db.prepare(
+  `UPDATE messages SET last_error = ?, next_attempt_at = ?, updated_at = datetime('now') WHERE id = ? AND status = 'pending'`,
 );
 const statusOfStmt = db.prepare(`SELECT status FROM messages WHERE id = ?`);
 
@@ -164,7 +190,7 @@ export function isStillPending(id: number): boolean {
 }
 
 const supersedeStmt = db.prepare(`
-  UPDATE messages SET status = 'failed', last_error = 'superseded', dropped_unsent = (attempts = 0), updated_at = datetime('now')
+  UPDATE messages SET status = 'failed', last_error = 'superseded', dropped_unsent = ${REFUNDABLE_IF_DROPPED}, updated_at = datetime('now')
   WHERE project = ? AND recipient = ? AND event = ? AND status = 'pending'
 `);
 
@@ -179,8 +205,39 @@ export function supersedePending(project: string, recipient: string, event: stri
   return Number(supersedeStmt.run(project, recipient, event).changes);
 }
 
-export function recordFailedAttempt(id: number, channel: Channel, error: string): void {
-  recordAttemptStmt.run(channel, error, id);
+/** A network attempt that failed; the row is not fetched again for `retryInMs`. */
+export function recordFailedAttempt(id: number, channel: Channel, error: string, retryInMs = 0): void {
+  recordAttemptStmt.run(channel, error, toSqliteUtc(Date.now() + retryInMs), id);
+}
+
+/**
+ * Puts a row back for later WITHOUT spending one of its attempts — for a
+ * failure that says nothing about the message itself (a WhatsApp lookup that
+ * timed out). Counting those used to let `attempts` pass the limit, and made
+ * an OTP that then expired unsent look "maybe delivered" to the daily cap.
+ */
+export function deferMessage(id: number, reason: string, retryInMs: number): void {
+  deferStmt.run(reason, toSqliteUtc(Date.now() + retryInMs), id);
+}
+
+const expireOverdueStmt = db.prepare(`
+  UPDATE messages SET status = 'failed', last_error = 'expired_before_send',
+    dropped_unsent = ${REFUNDABLE_IF_DROPPED}, updated_at = datetime('now')
+  WHERE status = 'pending' AND expires_at IS NOT NULL AND expires_at < datetime('now')
+    AND id NOT IN (SELECT value FROM json_each(?))
+`);
+
+/**
+ * Fails every pending message whose deadline has passed, in one statement.
+ *
+ * The per-row expiry check in the worker only ever sees rows it fetches — and
+ * rows pinned to a channel that cannot send are deliberately NOT fetched. So
+ * they never expired: a forced-channel row sat pending forever, held a slot
+ * under both queue caps, and kept /health on queue_stalled (503) permanently.
+ * `keep` are rows with a send still in flight, whose outcome is not known yet.
+ */
+export function expireOverdue(keep: Iterable<number> = []): number {
+  return Number(expireOverdueStmt.run(JSON.stringify([...keep])).changes);
 }
 
 const statusStmt = db.prepare(`SELECT id, event, recipient, channel, status, attempts, last_error, created_at, updated_at FROM messages WHERE id = ? AND project = ?`);

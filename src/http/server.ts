@@ -1,4 +1,4 @@
-import express, { type ErrorRequestHandler } from 'express';
+import express, { type ErrorRequestHandler, type RequestHandler } from 'express';
 import { requireProjectApiKey } from './auth.ts';
 import { router } from './routes.ts';
 
@@ -31,14 +31,31 @@ const handleBodyErrors: ErrorRequestHandler = (err, _req, res, next) => {
 // and both clients (talisham.com, khidam.com) parse the body as JSON and fall
 // back to a generic "unreachable", so the real cause reached nobody in a
 // usable form. Registered LAST: error middleware only catches what precedes it.
+//
+// A 4xx that Express itself raised is the caller's mistake, not ours: a
+// malformed path like `/status/%` fails URI decoding with status 400. It used
+// to come back as a 500 with a stack trace in the phone's log per request.
 const handleUnexpected: ErrorRequestHandler = (err, _req, res, _next) => {
+  const status = (err as { status?: unknown; statusCode?: unknown })?.status ?? (err as { statusCode?: unknown })?.statusCode;
+  if (typeof status === 'number' && status >= 400 && status < 500) {
+    if (!res.headersSent) res.status(status).json({ error: 'bad_request' });
+    return;
+  }
   console.error('[http] خطأ غير متوقع في المعالجة', err);
   if (res.headersSent) return;
   res.status(500).json({ error: 'internal_error' });
 };
 
+// Express's own fallback is an HTML "Cannot GET /x" page — the same
+// unparseable body the handler above exists to keep away from both clients.
+const handleNotFound: RequestHandler = (_req, res) => {
+  res.status(404).json({ error: 'not_found' });
+};
+
 export function createServer() {
   const app = express();
+  // Nothing gains from telling every caller which framework answers.
+  app.disable('x-powered-by');
   // The key is checked BEFORE the body is read: it lives in a header, and
   // parsing up to 32 KB of JSON for a caller who is about to get a 401 was
   // work — and log lines — spent on anyone who can reach the tunnel.
@@ -46,6 +63,7 @@ export function createServer() {
   app.use(express.json({ limit: '32kb' })); // plan 9, point 2 — reject oversized bodies early
   app.use(handleBodyErrors);
   app.use(router);
+  app.use(handleNotFound);
   app.use(handleUnexpected);
   return app;
 }

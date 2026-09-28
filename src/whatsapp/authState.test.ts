@@ -9,7 +9,7 @@ import { mkdtempSync, readdirSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { initAuthCreds } from '@whiskeysockets/baileys';
-import { probeCreds, useAtomicMultiFileAuthState } from './authState.ts';
+import { probeCreds, useAtomicMultiFileAuthState, lockCount } from './authState.ts';
 
 function freshFolder(): string {
   return mkdtempSync(path.join(tmpdir(), 'sms-api-auth-'));
@@ -89,4 +89,15 @@ test('concurrent writes to the same file serialize instead of interleaving', asy
   assert.equal(await probeCreds(folder), 'ok');
   JSON.parse(readFileSync(path.join(folder, 'creds.json'), 'utf-8')); // throws if torn
   assert.ok(state.creds.registrationId >= 0);
+});
+
+test('per-file locks are released once nothing waits on them, instead of accumulating for every key ever written', async () => {
+  const folder = freshFolder();
+  const auth = await useAtomicMultiFileAuthState(folder);
+  const keys: Record<string, { public: Uint8Array; private: Uint8Array }> = {};
+  for (let i = 0; i < 50; i++) keys[String(i)] = { public: new Uint8Array([i]), private: new Uint8Array([i]) };
+  await auth.state.keys.set({ 'pre-key': keys });
+  await auth.state.keys.get('pre-key', Object.keys(keys));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(lockCount(), 0);
 });

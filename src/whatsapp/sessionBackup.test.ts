@@ -40,6 +40,7 @@ const {
   quarantineLocal,
   quarantineDeadSession,
   clearStaleAuthFiles,
+  runBackupNowForTest,
 } = await import('./sessionBackup.ts');
 const crypto = await import('node:crypto');
 const zlib = await import('node:zlib');
@@ -351,4 +352,40 @@ test('a failing R2 quarantine does not stop the local quarantine from still happ
     },
   );
   assert.deepEqual(calls, ['local'], 'a dead identity must still be quarantined locally even if R2 could not be reached');
+});
+
+test('a key file that exists but cannot be read aborts the snapshot instead of backing up a partial key set', async () => {
+  reset();
+  writeSession({ registrationId: 1 }, { 'session-a': { k: 1 } });
+  assert.equal(await snapshotLocal(), 2);
+  // EISDIR stands in for EMFILE/EBUSY/EIO: present, but unreadable right now.
+  mkdirSync(path.join(AUTH_DIR, 'session-b.json'));
+  await assert.rejects(() => snapshotLocal());
+  assert.deepEqual(backupFiles(), ['creds.json', 'session-a.json'], 'the complete backup must survive');
+});
+
+test('a backup still running when the logout lands does not write the revoked session back', async () => {
+  reset();
+  writeSession({ registrationId: 1 });
+  const body = JSON.stringify({ k: 'x'.repeat(2000) });
+  for (let i = 0; i < 1500; i++) writeFileSync(path.join(AUTH_DIR, `pre-key-${i}.json`), body, 'utf-8');
+  const quiet = { info: () => {}, error: () => {} };
+
+  let backupFinished = false;
+  const backup = runBackupNowForTest(quiet, () => true).then(() => {
+    backupFinished = true;
+  }); // mid-read of 1500 files
+  let finishedWhenQuarantined: boolean | undefined;
+  await quarantineDeadSession(quiet, {
+    quarantineR2: async () => {},
+    quarantineLocal: (suffix) => {
+      finishedWhenQuarantined = backupFinished;
+      quarantineLocal(suffix);
+    },
+  });
+  await backup;
+
+  assert.equal(finishedWhenQuarantined, true, 'the quarantine must wait for the running snapshot, not race it');
+  assert.ok(!existsSync(BUNDLE), 'the in-flight snapshot must not re-create the backup at its usual path');
+  assert.deepEqual(await restoreFromLocal(), { ok: false, reason: 'no_backup' });
 });

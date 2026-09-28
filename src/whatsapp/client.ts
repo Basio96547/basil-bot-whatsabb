@@ -1,9 +1,12 @@
 import path from 'node:path';
 import makeWASocket, {
   fetchLatestBaileysVersion,
+  generateMessageIDV2,
   DisconnectReason,
   DEFAULT_CONNECTION_CONFIG,
   type AuthenticationCreds,
+  type BinaryNode,
+  type ReachoutTimelockState,
   type WASocket,
 } from '@whiskeysockets/baileys';
 import qrcodeTerminal from 'qrcode-terminal';
@@ -13,7 +16,7 @@ import { scheduleSessionBackup, restoreSessionFromR2, restoreFromLocal, quaranti
 import { probeCreds, useAtomicMultiFileAuthState, type CredsProbe } from './authState.ts';
 import { notifyWork } from '../queue/wakeup.ts';
 import { rememberPairing, checkSendRate } from '../queue/sendRate.ts';
-import { parseEnforcement, recordEnforcement, activeEnforcement, type Enforcement } from './enforcement.ts';
+import { parseEnforcement, recordEnforcement, clearEnforcement, activeEnforcement, type Enforcement } from './enforcement.ts';
 
 /** Records a restriction WhatsApp just announced, and says so loudly once. */
 function noteEnforcement(found: Enforcement): void {
@@ -23,6 +26,26 @@ function noteEnforcement(found: Enforcement): void {
   app.error(
     `[whatsapp] واتساب قيّد الحساب (${found.type}) حتى ${new Date(found.endsAtMs).toISOString()} — الإرسال موقوف، ولا تمسح QR جديداً قبل انتهاء المدة`,
   );
+}
+
+/**
+ * Baileys' own typed report of the account's restriction state (rc14+), sent
+ * both when one starts and when it is LIFTED — the raw-notification parser
+ * below only ever sees a start, so an early lift used to keep sending blocked
+ * (and a new QR withheld) until the original end time.
+ */
+function applyReachoutTimelock(lock: ReachoutTimelockState): void {
+  if (lock.isActive) {
+    // WA Web itself assumes one minute when the server gives no end time.
+    const endsAtMs = lock.timeEnforcementEnds?.getTime() ?? Date.now() + 60_000;
+    noteEnforcement({ type: lock.enforcementType ?? 'UNKNOWN', endsAtMs });
+    return;
+  }
+  if (activeEnforcement()) {
+    clearEnforcement();
+    app.info('[whatsapp] واتساب رفع القيد عن الحساب — الإرسال يُستأنف');
+    notifyWork();
+  }
 }
 
 const logger = pino({ level: 'silent' }); // Baileys' own internal logger — noisy at 'info', we log our own lines below
@@ -56,6 +79,20 @@ const RESTART_REQUIRED_DELAY_MS = 1_000;
 // ban signal. Retried rarely instead, so the service still comes back on its
 // own once the other copy is gone.
 const CONTESTED_RECONNECT_DELAY_MS = 30 * 60_000;
+
+// setTimeout silently treats anything above ~24.8 days as 1 ms. A restriction
+// that long (the enforcement gate below waits for its end) turned the
+// reconnect timer into a tight loop — dozens of connect attempts a second,
+// each with a log line and, with R2 on, a download. Waking every few hours
+// instead costs nothing: the gate simply re-checks and waits again.
+const MAX_RECONNECT_DELAY_MS = 6 * 60 * 60_000;
+
+// The backoff ramp only resets once a connection has proven itself. Resetting
+// on every 'open' meant a link that opens and drops straight away (a flaky
+// network, a server that accepts and then kicks) retried every 5 s forever —
+// the reconnect churn the ramp exists to prevent.
+const STABLE_CONNECTION_MS = 2 * 60_000;
+let openedAtMs = 0;
 
 /**
  * A session that has completed pairing at least once — see connectWhatsApp.
@@ -169,7 +206,10 @@ const authDir = path.join(config.dataDir, 'auth-session');
 function scheduleReconnect(delayOverrideMs?: number): void {
   if (reconnectTimer) return; // one chain at a time, however many close events arrive
 
-  const delay = delayOverrideMs ?? RECONNECT_DELAYS_MS[Math.min(reconnectAttempt, RECONNECT_DELAYS_MS.length - 1)];
+  const delay = Math.min(
+    delayOverrideMs ?? RECONNECT_DELAYS_MS[Math.min(reconnectAttempt, RECONNECT_DELAYS_MS.length - 1)],
+    MAX_RECONNECT_DELAY_MS,
+  );
   if (delayOverrideMs === undefined) reconnectAttempt += 1;
   app.info(`[whatsapp] إعادة محاولة خلال ${Math.round(delay / 1000)}ث`);
 
@@ -197,7 +237,18 @@ function scheduleReconnect(delayOverrideMs?: number): void {
 // `state` so /health (and the monitor polling it) can report it.
 // Returns the probe so the caller can decide whether it is even safe to load
 // (or generate) an auth state afterward — see connectWhatsApp's use of it.
-export async function prepareSession(): Promise<CredsProbe> {
+// How many connect attempts in a row may find the session gone and R2
+// unreachable before a fresh identity (a QR) is accepted instead. Going
+// straight to a fresh identity on the FIRST failed download — a boot before
+// the network is fully back — was close to irreversible: Baileys saves the
+// fresh creds.json before any QR is scanned (edge_routing), after which
+// every probe reads 'ok' and the good R2 copy is never tried again. Waiting
+// forever is no better when R2 is down for good, so after this many tries
+// along the backoff ramp (about ten minutes) the QR is offered after all.
+const MAX_R2_RESTORE_RETRIES = 5;
+let r2RestoreFailures = 0;
+
+export async function prepareSession(): Promise<CredsProbe | 'backup_unreachable'> {
   const probe = await probeCreds(authDir);
   // Nothing to repair — leave whatever the last connect concluded in place;
   // only a successful 'open' below clears a previous warning.
@@ -233,11 +284,20 @@ export async function prepareSession(): Promise<CredsProbe> {
 
   const restore = await restoreSessionFromR2();
   if (restore.ok) {
+    r2RestoreFailures = 0;
     state.sessionOrigin = 'restored';
     state.sessionNote = `${problem} — استُعيدت ${restore.files} ملف من نسخة R2`;
     app.info(`[whatsapp] ${state.sessionNote}`);
     return probe;
   }
+
+  if (restore.reason === 'error' && r2RestoreFailures < MAX_R2_RESTORE_RETRIES) {
+    r2RestoreFailures += 1;
+    state.sessionNote = `${problem}، ولا نسخة محلية، وتعذّر الوصول إلى R2 — إعادة المحاولة (${r2RestoreFailures}/${MAX_R2_RESTORE_RETRIES}) قبل قبول هوية جديدة`;
+    app.error(`[whatsapp] ${state.sessionNote}`, restore.error);
+    return 'backup_unreachable';
+  }
+  r2RestoreFailures = 0;
 
   state.sessionNote =
     restore.reason === 'not_configured'
@@ -259,6 +319,11 @@ export function startWhatsApp(): void {
 
 export async function connectWhatsApp(): Promise<void> {
   const probe = await prepareSession();
+  if (probe === 'backup_unreachable') {
+    // Same retry-with-backoff as below, for the same reason: nothing may
+    // mint an identity while the real one might still be one download away.
+    throw new Error('الجلسة مفقودة ونسخة R2 لم تُحمَّل بعد — إعادة المحاولة بدل توليد هوية جديدة');
+  }
   if (probe === 'unreadable') {
     // Do not let useAtomicMultiFileAuthState's own creds read hit this exact
     // transient error independently — see prepareSession's comment. Throwing
@@ -395,6 +460,14 @@ export async function connectWhatsApp(): Promise<void> {
     if (myGeneration !== generation) return; // superseded socket — ignore
     const { connection, lastDisconnect, qr } = update;
 
+    if (update.reachoutTimeLock) {
+      try {
+        applyReachoutTimelock(update.reachoutTimeLock);
+      } catch (err) {
+        app.error('[whatsapp] تعذّر تسجيل حالة قيد الحساب', err);
+      }
+    }
+
     if (qr) {
       console.log('امسح كود QR هذا من واتساب (الأجهزة المرتبطة → ربط جهاز):');
       qrcodeTerminal.generate(qr, { small: true });
@@ -410,7 +483,7 @@ export async function connectWhatsApp(): Promise<void> {
       // works, so the alert shouldn't keep firing.
       state.sessionOrigin = 'existing';
       state.sessionNote = null;
-      reconnectAttempt = 0;
+      openedAtMs = Date.now();
       // Starts (or resumes) the warm-up clock for this identity. A different
       // JID here means a genuine re-pair, which begins a new ramp — exactly
       // the situation after an enforcement, when the number is most fragile.
@@ -437,6 +510,8 @@ export async function connectWhatsApp(): Promise<void> {
 
     if (connection === 'close') {
       state.connected = false;
+      if (openedAtMs && Date.now() - openedAtMs >= STABLE_CONNECTION_MS) reconnectAttempt = 0;
+      openedAtMs = 0;
       const statusCode = (lastDisconnect?.error as { output?: { statusCode?: number } } | undefined)?.output
         ?.statusCode;
       const loggedOut = statusCode === DisconnectReason.loggedOut;
@@ -451,7 +526,16 @@ export async function connectWhatsApp(): Promise<void> {
         // one would be auto-restored on the next connect attempt and repeat
         // this exact failure with no visible reason why. No reconnect is
         // scheduled here: that stays a human decision, same as before.
-        void quarantineDeadSession(app).catch((err) => app.error('[whatsapp] فشل عزل الجلسة الميتة', err));
+        //
+        // Only for an identity that WAS linked. Backups are only ever taken
+        // from a linked, connected session, so while a QR is still pending
+        // (a fresh identity — perhaps because a restore failed on a bad
+        // network) the backups on disk and in R2 belong to a DIFFERENT
+        // identity, quite possibly the good one; quarantining them over a
+        // 401 on the QR screen would destroy the only way back to it.
+        if (linked) {
+          void quarantineDeadSession(app).catch((err) => app.error('[whatsapp] فشل عزل الجلسة الميتة', err));
+        }
         return;
       }
 
@@ -483,6 +567,80 @@ export function toJid(digitsOnlyPhone: string): string {
   return `${digitsOnlyPhone}@s.whatsapp.net`;
 }
 
+// 463 in a message ack: this account may not start a chat with this contact
+// right now — the reach-out restriction, or a missing privacy token that
+// comes with it. Baileys' own guidance: never retry, each retry is another
+// "reach out" counted against the account.
+const ACCOUNT_RESTRICTED_ACK = '463';
+
+/** WhatsApp's server answered a send with an error instead of accepting it. */
+export class WhatsAppRejectedError extends Error {
+  readonly code: string;
+  constructor(code: string) {
+    super(`whatsapp_rejected_${code}`);
+    this.name = 'WhatsAppRejectedError';
+    this.code = code;
+  }
+
+  /** Retrying cannot help and would make the account's standing worse. */
+  get permanent(): boolean {
+    return this.code === ACCOUNT_RESTRICTED_ACK;
+  }
+}
+
+// How long the ack is waited for before the message is given up as not
+// received. It is NOT the send's timeout — the worker bounds that (15 s) and
+// holds the row back while this call is still running, recording it as sent
+// if the ack lands late. waitForMessage's clock starts at registration, i.e.
+// BEFORE sendMessage's own device and pre-key lookups for a new contact, so a
+// short budget here failed sends that had in fact gone out, and the retry
+// delivered a duplicate. A half-open socket still ends this early: its
+// 'close' rejects the wait.
+const ACK_GIVE_UP_MS = 4 * 60_000;
+
+type AckingSocket = Pick<WASocket, 'sendMessage' | 'waitForMessage'> & { user?: { id?: string } };
+
+/**
+ * Sends and waits for the server's acknowledgement of THIS message.
+ *
+ * sendMessage() resolves the moment the stanza is written to the socket — not
+ * when WhatsApp accepts it. A refusal (463 during a restriction, which every
+ * new-contact code hits) arrives afterwards as an error ack that nothing here
+ * listened for, and a half-open socket (the drop goes unnoticed until the next
+ * keep-alive, up to two minutes on this phone) swallows the stanza without an
+ * ack at all. Both were recorded 'sent': the customer waited for a code that
+ * never came, the circuit breaker counted a success, and no fallback ran.
+ *
+ * The id is chosen here so the wait is registered BEFORE the send — the ack
+ * can arrive before sendMessage's own promise resolves.
+ */
+export async function sendTextAwaitingAck(
+  sock: AckingSocket,
+  jid: string,
+  text: string,
+  ackTimeoutMs = ACK_GIVE_UP_MS,
+): Promise<void> {
+  const messageId = generateMessageIDV2(sock.user?.id);
+  const ack = sock.waitForMessage<BinaryNode>(messageId, ackTimeoutMs);
+  ack.catch(() => {}); // settled below; this only stops an early rejection counting as unhandled
+  await sock.sendMessage(jid, { text }, { messageId });
+  const node = await ack;
+  if (!node) throw new Error('no_server_ack');
+  const error = node.attrs?.error;
+  if (error) throw new WhatsAppRejectedError(String(error));
+}
+
 export async function sendWhatsAppText(digitsOnlyPhone: string, text: string): Promise<void> {
-  await getSocket().sendMessage(toJid(digitsOnlyPhone), { text });
+  const sock = getSocket();
+  try {
+    await sendTextAwaitingAck(sock, toJid(digitsOnlyPhone), text);
+  } catch (err) {
+    if (err instanceof WhatsAppRejectedError && err.permanent) {
+      // Ask WhatsApp whether the whole account is restricted: the answer
+      // comes back as connection.update → applyReachoutTimelock, which stops
+      // every other queued message from knocking on the same closed door.
+      sock.fetchAccountReachoutTimelock().catch((fetchErr) => app.error('[whatsapp] تعذّر الاستعلام عن قيد الحساب', fetchErr));
+    }
+    throw err;
+  }
 }

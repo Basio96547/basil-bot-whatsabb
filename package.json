@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "engines": {
-    "node": ">=22.5.0"
+    "node": ">=22.13.0"
   },
   "//tsx": "اعتمادية تشغيل لا تطوير: الخدمة تُشغَّل على الجوال بـ node --import tsx مباشرة من TypeScript (راجع ecosystem.config.cjs)، فوجودها في devDependencies جعل `npm install --omit=dev` يحذف المفسّر نفسه — والخدمة تدور في حلقة انهيار بـ ERR_MODULE_NOT_FOUND.",
   "scripts": {

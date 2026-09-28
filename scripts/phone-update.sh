@@ -1,15 +1,22 @@
 #!/data/data/com.termux/files/usr/bin/sh
-# تحديث الخدمة على الجوال بعد `git pull`. آمن للتكرار — تشغيله مرتين لا يضر.
+# تحديث الخدمة على الجوال بعد وصول كود جديد. آمن للتكرار — تشغيله مرتين لا يضر.
 #
-# الاستعمال داخل Termux:
-#   cd ~/sms-api && git pull
-#   sh scripts/phone-update.sh
+# الاستعمال داخل Termux (بعد `git pull` إن كان المجلد مستودع git، أو بعد نسخ
+# الملفات يدوياً — ~/sms-api الحالي نُقل بـ adb push، وطريقه المعتاد هو
+# scripts/push-to-phone.ps1 من الكمبيوتر):
+#   sh ~/sms-api/scripts/phone-update.sh
 #
 # وُجد لأن التحديث اليدوي يحتاج عدة أوامر متتابعة، ولصقها سطراً سطراً في
 # Termux أفسدها أكثر من مرة (أسطر تندمج، مسافات تُضاف). أمر واحد قصير أأمن.
 
 set -e
 cd "$(dirname "$0")/.."
+
+echo "=== 0) الحزم ==="
+# كود جديد قد يعتمد على حزمة جديدة؛ بدونها تُقلع الخدمة في حلقة انهيار
+# (ERR_MODULE_NOT_FOUND). الفحص المسبق أدناه يكشف ذلك، لكن التثبيت هنا يجعله
+# لا يحدث أصلاً.
+npm install --omit=dev --no-audit --no-fund
 
 echo "=== 1) مفاتيح المشاريع ==="
 # لا يُكتب أي مفتاح داخل هذا الملف — المستودع على GitHub. المفقود يُولَّد هنا
@@ -37,10 +44,10 @@ sleep 15
 pm2 status
 
 echo "=== 5) الفحص المحلي ==="
-key=$(grep '^PROJECT_API_KEY_STORE=' .env | cut -d= -f2-)
-# `|| true` لأن `set -e` أعلاه كان سيوقف السكربت قبل طباعة النتيجة لو ردّ
+key=$(grep '^PROJECT_API_KEY_STORE=' .env | tail -1 | cut -d= -f2- | tr -d '\r"')
+# `|| echo` لأن `set -e` أعلاه كان سيوقف السكربت قبل طباعة النتيجة لو ردّ
 # curl بخطأ — وهي بالضبط الحالة التي نحتاج أن نراها فيها.
-curl -s -m 10 -H "Authorization: Bearer $key" http://localhost:3000/health || echo "(الخدمة لم تردّ بعد)"
+curl -s -m 10 -H "Authorization: Bearer $key" http://127.0.0.1:3000/health || echo "(الخدمة لم تردّ بعد)"
 echo ""
 echo "=== تم ==="
 echo "تحقّق من الخارج أيضاً: https://sms-api.talisham.com/health"

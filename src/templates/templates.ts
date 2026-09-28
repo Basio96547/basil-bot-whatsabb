@@ -106,6 +106,18 @@ function variantsFor(event: string, overrides?: TemplateOverrides): string[] | u
 }
 
 /**
+ * Every placeholder a caller-supplied value can land in for `event` — the
+ * payload fields that can reach a customer's chat. The ambient ones are left
+ * out: the worker fills those itself.
+ */
+export function payloadPlaceholders(event: string, overrides?: TemplateOverrides): string[] {
+  const variants = variantsFor(event, overrides) ?? [];
+  const names = new Set(variants.flatMap(placeholdersIn));
+  for (const ambient of AMBIENT_PLACEHOLDERS) names.delete(ambient);
+  return [...names];
+}
+
+/**
  * Placeholders the caller must supply for at least one variant of `event` to
  * be renderable — empty when the payload is already sufficient.
  *

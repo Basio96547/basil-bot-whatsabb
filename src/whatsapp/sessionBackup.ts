@@ -69,8 +69,14 @@ async function* bundleFragments(stats: BundleStats): AsyncGenerator<string> {
     let contents: string;
     try {
       contents = await readFile(path.join(AUTH_DIR, name), 'utf-8');
-    } catch {
-      continue; // Baileys deletes keys while we work — skip, don't abort
+    } catch (error) {
+      // Baileys deletes keys while we work — a file that is gone is skipped.
+      // Anything else (EMFILE, EBUSY, EIO on this ~7500-file folder) aborts
+      // the snapshot: skipping those produced a bundle missing keys the live
+      // session still uses, which then REPLACED the complete backup — and a
+      // restore from it deletes every live key it does not contain.
+      if ((error as { code?: string }).code === 'ENOENT') continue;
+      throw error;
     }
     if (name === 'creds.json') {
       // A snapshot is only as good as its creds.json — one that does not
@@ -120,12 +126,21 @@ export async function encryptFragments(fragments: Iterable<string> | AsyncIterab
     gzip.on('error', reject);
   });
 
-  for await (const fragment of fragments) {
-    // Respect backpressure: without this the whole bundle queues inside the
-    // gzip stream's buffer and we are back to holding it all in memory.
-    if (!gzip.write(fragment)) {
-      await new Promise<void>((resolve) => gzip.once('drain', resolve));
+  try {
+    for await (const fragment of fragments) {
+      // Respect backpressure: without this the whole bundle queues inside the
+      // gzip stream's buffer and we are back to holding it all in memory.
+      // Raced against `done` so a stream error cannot leave this waiting for
+      // a 'drain' that will never come — a backup that never settles blocks
+      // every later one, and the logout quarantine that waits for it.
+      if (!gzip.write(fragment)) {
+        await Promise.race([new Promise<void>((resolve) => gzip.once('drain', resolve)), done]);
+      }
     }
+  } catch (error) {
+    gzip.destroy();
+    done.catch(() => {});
+    throw error;
   }
   gzip.end();
   await done;
@@ -179,6 +194,14 @@ function parseBundle(plaintext: string): Array<[string, string]> | null {
   );
 }
 
+// Every R2 call is bounded. The SDK's own defaults are "no timeout" at every
+// level, so on this phone's stalling network one call could hang for good —
+// and the boot-time restore sits in front of connectWhatsApp, whose retry
+// only ever runs on a REJECTION: a hung download meant WhatsApp never
+// connected at all, with nothing logged.
+const R2_CONNECT_TIMEOUT_MS = 10_000;
+const R2_CALL_TIMEOUT_MS = 90_000;
+
 let s3Client: S3Client | null = null;
 function getS3(): S3Client {
   if (!s3Client) {
@@ -189,15 +212,25 @@ function getS3(): S3Client {
         accessKeyId: config.sessionBackup.r2AccessKeyId,
         secretAccessKey: config.sessionBackup.r2SecretAccessKey,
       },
+      requestHandler: {
+        connectionTimeout: R2_CONNECT_TIMEOUT_MS,
+        requestTimeout: R2_CALL_TIMEOUT_MS,
+        throwOnRequestTimeout: true,
+      },
     });
   }
   return s3Client;
 }
 
+/** The abort signal also covers reading a response body, which the handler's own timeouts do not. */
+function r2CallOptions(): { abortSignal: AbortSignal } {
+  return { abortSignal: AbortSignal.timeout(R2_CALL_TIMEOUT_MS) };
+}
+
 export { BACKUP_KEY };
 
 async function uploadBundle(bundle: Buffer): Promise<void> {
-  await getS3().send(new PutObjectCommand({ Bucket: config.sessionBackup.r2Bucket, Key: BACKUP_KEY, Body: bundle }));
+  await getS3().send(new PutObjectCommand({ Bucket: config.sessionBackup.r2Bucket, Key: BACKUP_KEY, Body: bundle }), r2CallOptions());
 }
 
 // Removes any live .json file NOT in `keep` — shared by both restore paths so
@@ -302,12 +335,29 @@ export type RestoreResult =
 // script — a divergence between "what the runbook does" and "what the service
 // does on its own" is exactly the kind of thing that bites during an outage.
 export async function restoreSessionFromR2(): Promise<RestoreResult> {
+  const fetched = await fetchR2Backup();
+  if (!fetched.ok) return fetched;
+  try {
+    await writeSessionFiles(fetched.files);
+    return { ok: true, files: fetched.files.length };
+  } catch (error) {
+    return { ok: false, reason: 'error', error };
+  }
+}
+
+/**
+ * Downloads, decrypts and parses the R2 bundle WITHOUT touching the live
+ * session — what `scripts/restore-session.ts` runs by default to prove the
+ * backup is there and opens with the current key.
+ */
+export async function fetchR2Backup(): Promise<
+  { ok: true; files: Array<[string, string]> } | { ok: false; reason: 'not_configured' | 'no_backup' | 'error'; error?: unknown }
+> {
   if (!config.sessionBackup.enabled) return { ok: false, reason: 'not_configured' };
 
   try {
-    const response = await getS3().send(
-      new GetObjectCommand({ Bucket: config.sessionBackup.r2Bucket, Key: BACKUP_KEY }),
-    );
+    const options = r2CallOptions();
+    const response = await getS3().send(new GetObjectCommand({ Bucket: config.sessionBackup.r2Bucket, Key: BACKUP_KEY }), options);
     if (!response.Body) return { ok: false, reason: 'no_backup' };
 
     const chunks: Buffer[] = [];
@@ -318,9 +368,7 @@ export async function restoreSessionFromR2(): Promise<RestoreResult> {
     // with the existing (possibly still usable) files left untouched.
     const files = parseBundle(decryptBundle(Buffer.concat(chunks)));
     if (!files) return { ok: false, reason: 'no_backup' };
-
-    await writeSessionFiles(files);
-    return { ok: true, files: files.length };
+    return { ok: true, files };
   } catch (error) {
     const code = (error as { name?: string })?.name;
     if (code === 'NoSuchKey' || code === 'NotFound') return { ok: false, reason: 'no_backup' };
@@ -362,8 +410,9 @@ async function quarantineR2(suffix: string): Promise<void> {
   const bucket = config.sessionBackup.r2Bucket;
   await getS3().send(
     new CopyObjectCommand({ Bucket: bucket, CopySource: `/${bucket}/${BACKUP_KEY}`, Key: `whatsapp-session.loggedout-${suffix}.enc` }),
+    r2CallOptions(),
   );
-  await getS3().send(new DeleteObjectCommand({ Bucket: bucket, Key: BACKUP_KEY }));
+  await getS3().send(new DeleteObjectCommand({ Bucket: bucket, Key: BACKUP_KEY }), r2CallOptions());
 }
 
 /**
@@ -399,16 +448,38 @@ export async function quarantineDeadSession(
   const doR2 = deps.quarantineR2 ?? quarantineR2;
   const suffix = `loggedout-${timestampSuffix()}`;
 
+  // A snapshot already running when the logout lands would otherwise finish
+  // AFTER the quarantine and write the revoked session straight back — the
+  // local bundle to its usual path, the R2 object to its usual key — so the
+  // next start restored the dead identity instead of showing a QR (and,
+  // reading a folder being renamed away under it, only part of its keys).
+  // Nothing new starts (the epoch below), and whatever is running is waited
+  // for first.
+  quarantineEpoch += 1;
+  if (debounceTimer) {
+    clearTimeout(debounceTimer);
+    debounceTimer = null;
+    firstDeferredAt = 0;
+  }
+  if (inFlightBackup) {
+    const waited = await Promise.race([
+      inFlightBackup.then(() => true),
+      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), QUARANTINE_WAIT_MS).unref?.()),
+    ]);
+    if (!waited) logger.error('[session-backup] نسخة احتياطية جارية لم تنتهِ في مهلتها — يُعزل على أي حال', null);
+  }
+
   if (config.sessionBackup.enabled) {
     try {
       await doR2(suffix);
       logger.info('[session-backup] عُزلت نسخة R2');
     } catch (err) {
-      // Best-effort: the local quarantine below still runs regardless, and a
-      // permanently failed R2 quarantine (as opposed to a crash mid-attempt)
-      // was already only ever best-effort — see the module header.
+      // Best-effort: the local quarantine below still runs regardless. But
+      // say plainly what it leaves behind: with the local copies moved aside,
+      // the next start finds nothing locally and WILL restore this dead
+      // session from R2 — move or delete `whatsapp-session.enc` by hand.
       logger.error(
-        '[session-backup] تعذّر عزل نسخة R2 — ستبقى الجلسة الميتة قابلة للاستعادة منها لو فشلت الاستعادة المحلية لسبب آخر',
+        '[session-backup] تعذّر عزل نسخة R2 — الإقلاع التالي سيستعيد الجلسة الميتة منها! انقل whatsapp-session.enc يدوياً في R2',
         err,
       );
     }
@@ -419,6 +490,11 @@ export async function quarantineDeadSession(
 }
 
 let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+// Bumped by a logout quarantine; a backup that began under an older epoch
+// writes nothing further.
+let quarantineEpoch = 0;
+let inFlightBackup: Promise<void> | null = null;
+const QUARANTINE_WAIT_MS = 2 * R2_CALL_TIMEOUT_MS;
 // When the first postponed snapshot became due. The debounce restarted its
 // timer on every creds.update with no ceiling, so a burst of updates arriving
 // faster than every 30s postponed the snapshot for as long as the burst
@@ -426,13 +502,14 @@ let debounceTimer: ReturnType<typeof setTimeout> | null = null;
 // valuable. Past this cap the pending snapshot runs regardless of new events.
 const MAX_DEBOUNCE_MS = 5 * 60_000;
 let firstDeferredAt = 0;
-// A backup now spans many awaits; a second one starting while the first is
-// still reading would race it for the same temp file.
-let backupInFlight = false;
-
 type BackupLogger = { info: (msg: string) => void; error: (msg: string, err: unknown) => void };
 
-async function runSessionBackup(logger: BackupLogger): Promise<void> {
+async function runSessionBackup(logger: BackupLogger, isEligible: () => boolean): Promise<void> {
+  const epoch = quarantineEpoch;
+  // Re-checked before each write: reading ~7500 files takes a while, and the
+  // session can be logged out (and quarantined) in the middle of it.
+  const stillWanted = (): boolean => epoch === quarantineEpoch && isEligible();
+
   let built: { bundle: Buffer; files: number };
   try {
     built = await buildSessionBundle();
@@ -441,6 +518,7 @@ async function runSessionBackup(logger: BackupLogger): Promise<void> {
     return;
   }
 
+  if (!stillWanted()) return;
   try {
     await snapshotLocal(built);
     logger.info(`[session-backup] نسخة محلية: ${built.files} ملف (${Math.ceil(built.bundle.length / 1024)} KB)`);
@@ -448,7 +526,7 @@ async function runSessionBackup(logger: BackupLogger): Promise<void> {
     logger.error('[session-backup] فشلت النسخة المحلية', err);
   }
 
-  if (!config.sessionBackup.enabled) return;
+  if (!config.sessionBackup.enabled || !stillWanted()) return;
   try {
     await uploadBundle(built.bundle);
     logger.info('[session-backup] uploaded encrypted session to R2');
@@ -477,13 +555,24 @@ export function scheduleSessionBackup(logger: BackupLogger, isEligible: () => bo
     debounceTimer = null;
     firstDeferredAt = 0;
     if (!isEligible()) return;
-    if (backupInFlight) {
+    if (inFlightBackup) {
       scheduleSessionBackup(logger, isEligible); // try again once this one is done
       return;
     }
-    backupInFlight = true;
-    void runSessionBackup(logger).finally(() => {
-      backupInFlight = false;
+    const run = runSessionBackup(logger, isEligible).catch((err) => logger.error('[session-backup] خطأ غير متوقع', err));
+    inFlightBackup = run;
+    void run.finally(() => {
+      if (inFlightBackup === run) inFlightBackup = null;
     });
   }, DEBOUNCE_MS);
+}
+
+/** Exported for testing: runs one backup now, tracked exactly like a scheduled one. */
+export function runBackupNowForTest(logger: BackupLogger, isEligible: () => boolean): Promise<void> {
+  const run = runSessionBackup(logger, isEligible);
+  inFlightBackup = run;
+  void run.finally(() => {
+    if (inFlightBackup === run) inFlightBackup = null;
+  });
+  return run;
 }

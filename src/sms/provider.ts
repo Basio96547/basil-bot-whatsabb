@@ -30,6 +30,9 @@ export async function sendSms(phone: string, text: string): Promise<SendResult> 
       signal: controller.signal,
     });
 
+    // The body is never used, but an unread one holds its connection open
+    // until garbage collection gets to it.
+    await response.body?.cancel().catch(() => {});
     if (!response.ok) {
       return { ok: false, error: `sms_provider_http_${response.status}` };
     }

@@ -7,19 +7,88 @@ import {
   dropUnsent,
   isStillPending,
   recordFailedAttempt,
+  deferMessage,
+  expireOverdue,
   type MessageRow,
 } from './queue.ts';
 import { resolveChannel, type Channel } from '../whatsapp/existence.ts';
-import { sendWhatsAppText, getConnectionState } from '../whatsapp/client.ts';
+import { sendWhatsAppText, getConnectionState, WhatsAppRejectedError } from '../whatsapp/client.ts';
 import { sendSms } from '../sms/provider.ts';
 import { renderTemplate } from '../templates/templates.ts';
 import { isPaused, recordSuccess, recordFailure } from './circuitBreaker.ts';
-import { sleepUnlessWoken } from './wakeup.ts';
+import { sleepUnlessWoken, notifyWork, workSignals } from './wakeup.ts';
 import { checkSendRate } from './sendRate.ts';
 import { activeEnforcement, type Enforcement } from '../whatsapp/enforcement.ts';
 
 const MAX_SEND_ATTEMPTS = 5;
 const SEND_TIMEOUT_MS = 15_000; // plan 9, point 5
+
+// How long a message waits after its Nth failed attempt before it is tried
+// again. Without any spacing the same oldest row came straight back on the
+// next tick: a lone message hitting a fast transient error ("Connection
+// Closed" a moment before the close event lands) spent all five attempts in
+// about twelve seconds — and the circuit breaker, which trips at the same
+// count, paused WhatsApp for every project on the very failure that had
+// already killed the message instead of buying it time.
+//
+// The whole ramp (7.5 min) stays under /health's queue_stalled threshold
+// (10 min): one message working through its retries is not a stalled queue.
+const RETRY_DELAYS_MS = [30_000, 60_000, 2 * 60_000, 4 * 60_000];
+// A WhatsApp lookup that timed out says nothing about the message — it is
+// put back without spending an attempt (see deferMessage).
+const LOOKUP_RETRY_DELAY_MS = 60_000;
+
+// Sends that outlived SEND_TIMEOUT_MS and have not settled yet, with when
+// they started. withTimeout stops WAITING; it cannot cancel the call. The row
+// stays pending, and the next tick used to pick it straight back up and send
+// it again while the first call was still running — any send slower than
+// about 20 s went out twice. A row in here is skipped until its call settles
+// (or, should it never settle, until UNSETTLED_GIVE_UP_MS has passed — kept
+// above client.ts's ACK_GIVE_UP_MS, so a WhatsApp send settles first).
+const unsettled = new Map<number, number>();
+const UNSETTLED_GIVE_UP_MS = 5 * 60_000;
+
+// Sends that reached the recipient but whose 'sent' could not be written (a
+// full disk). The row stayed pending, so it was sent AGAIN on every tick until
+// its deadline — up to one copy a minute for a day — and, being unrecorded,
+// none of those copies counted toward the hourly ceiling either. Kept here and
+// written as soon as the database accepts it; never re-sent meanwhile.
+const unrecorded = new Map<number, { channel: Channel; variantIndex: number }>();
+
+function recordSentOrRemember(id: number, channel: Channel, variantIndex: number, onlyIfPending: boolean): boolean {
+  try {
+    const recorded = onlyIfPending ? markSentIfStillPending(id, channel, variantIndex) : (markSent(id, channel, variantIndex), true);
+    unrecorded.delete(id);
+    return recorded;
+  } catch (err) {
+    unrecorded.set(id, { channel, variantIndex });
+    console.error(`[worker] رسالة ${id} أُرسلت لكن تعذّر تسجيلها — لن تُعاد، وسيُعاد التسجيل لاحقاً`, err);
+    return false;
+  }
+}
+
+/** Writes the 'sent' of any delivered message the database refused earlier. */
+export function flushUnrecorded(): void {
+  for (const [id, sent] of unrecorded) {
+    try {
+      markSentIfStillPending(id, sent.channel, sent.variantIndex);
+      unrecorded.delete(id);
+    } catch {
+      return; // the database still refuses writes — try again next tick
+    }
+  }
+}
+
+/** Rows whose outcome is still unknown, so nothing may decide it for them. */
+function rowsInFlight(): number[] {
+  const now = Date.now();
+  const ids = [...unrecorded.keys()];
+  for (const [id, since] of unsettled) {
+    if (now - since < UNSETTLED_GIVE_UP_MS) ids.push(id);
+    else unsettled.delete(id);
+  }
+  return ids;
+}
 
 // نبضة الخمول تتضاعف من ٥ ثوانٍ إلى دقيقة بدل أن تظل ثابتة عند ٥. الثابتة
 // كانت تُبقي معالج الجوال مستيقظاً على مدار الساعة (راجع wakeup.ts)، ولا
@@ -76,6 +145,10 @@ export interface WhatsAppGateDeps {
   pairedAtMs: () => number | null;
   activeEnforcement: () => Enforcement | null;
   checkSendRate: (pairedAtMs: number | null) => { allowed: boolean };
+  resolveChannel: (phone: string, forced?: Channel) => Promise<Channel>;
+  send: (channel: Channel, phone: string, text: string) => Promise<void>;
+  /** SEND_TIMEOUT_MS; shorter only in tests, which cannot wait 15 s per case. */
+  sendTimeoutMs?: number;
 }
 
 export const defaultGateDeps: WhatsAppGateDeps = {
@@ -83,6 +156,8 @@ export const defaultGateDeps: WhatsAppGateDeps = {
   pairedAtMs: () => getConnectionState().pairedAtMs,
   activeEnforcement,
   checkSendRate,
+  resolveChannel,
+  send: sendViaChannel,
 };
 
 /**
@@ -93,6 +168,12 @@ export const defaultGateDeps: WhatsAppGateDeps = {
  * في المؤقّتات لكل دفعة أثناء أي انقطاع دون أن تُرسل حرفاً واحداً.
  */
 export async function processMessage(msg: MessageRow, gateDeps: WhatsAppGateDeps = defaultGateDeps): Promise<boolean> {
+  // A send for this row is still in flight, or went out and is waiting to be
+  // recorded — either way, sending it now would be a second copy.
+  const inFlightSince = unsettled.get(msg.id);
+  if (inFlightSince !== undefined && Date.now() - inFlightSince < UNSETTLED_GIVE_UP_MS) return false;
+  if (unrecorded.has(msg.id)) return false;
+
   const project = getProjectById(msg.project);
   if (!project) {
     dropUnsent(msg.id, 'unknown_project');
@@ -140,9 +221,9 @@ export async function processMessage(msg: MessageRow, gateDeps: WhatsAppGateDeps
       // (sendViaChannel below), this await had nothing bounding it, so one
       // slow/hung lookup could block this whole batch of up to
       // sendBatchSize messages for minutes.
-      channel = await withTimeout(resolveChannel(msg.recipient, forcedChannel), SEND_TIMEOUT_MS);
+      channel = await withTimeout(gateDeps.resolveChannel(msg.recipient, forcedChannel), gateDeps.sendTimeoutMs ?? SEND_TIMEOUT_MS);
     } catch {
-      recordFailedAttempt(msg.id, msg.channel ?? 'whatsapp', 'channel_resolution_error');
+      deferMessage(msg.id, 'channel_resolution_error', LOOKUP_RETRY_DELAY_MS);
       return false;
     }
   }
@@ -165,9 +246,13 @@ export async function processMessage(msg: MessageRow, gateDeps: WhatsAppGateDeps
   // attempts; a long enough outage used to walk the oldest queued messages
   // all the way to permanently-failed without a single one ever reaching the
   // network. Leave them pending instead.
+  //
+  // A circuit-breaker pause is one more such reason: an auto-routed message
+  // used to wait out the whole pause (up to ten minutes) even with SMS ready.
   if (channel === 'whatsapp') {
     const whatsappBlocked =
       !gateDeps.isConnected() ||
+      isPaused('whatsapp') ||
       gateDeps.activeEnforcement() !== null ||
       !gateDeps.checkSendRate(gateDeps.pairedAtMs()).allowed;
     if (whatsappBlocked) {
@@ -216,28 +301,39 @@ export async function processMessage(msg: MessageRow, gateDeps: WhatsAppGateDeps
 
   let success = false;
   let lastError: string | undefined;
+  // WhatsApp itself refused the message in a way retrying only worsens (463:
+  // the account may not start new chats right now — each retry is one more
+  // "reach out" counted against it). See WhatsAppRejectedError.
+  let permanent = false;
 
   const firstChannel = channel;
-  const firstSend = sendViaChannel(firstChannel, msg.recipient, text);
+  const sendTimeoutMs = gateDeps.sendTimeoutMs ?? SEND_TIMEOUT_MS;
+  const firstSend = gateDeps.send(firstChannel, msg.recipient, text);
   try {
-    await withTimeout(firstSend, SEND_TIMEOUT_MS);
+    await withTimeout(firstSend, sendTimeoutMs);
     success = true;
   } catch (err) {
     lastError = describeError(err);
+    permanent = err instanceof WhatsAppRejectedError && err.permanent;
     recordFailure(channel);
     if (lastError === 'timeout') {
-      // withTimeout stops waiting; it cannot cancel the call. When that call
-      // does complete, the message WAS delivered — recording it keeps the
-      // next retry from delivering it a second time. Nothing to do if it
-      // fails late, or if a retry got there first.
+      // withTimeout stops waiting; it cannot cancel the call. Until that call
+      // settles the row is held back (see `unsettled`) — and when it does
+      // complete, the message WAS delivered: recording it keeps a later
+      // retry from delivering it a second time.
+      unsettled.set(msg.id, Date.now());
       firstSend.then(
         () => {
-          if (markSentIfStillPending(msg.id, firstChannel, variantIndex)) {
+          unsettled.delete(msg.id);
+          if (recordSentOrRemember(msg.id, firstChannel, variantIndex, true)) {
             recordSuccess(firstChannel);
             console.warn(`[worker] رسالة ${msg.id} وصلت بعد انتهاء المهلة — سُجّلت مُرسَلة بدل إعادة إرسالها`);
           }
         },
-        () => {},
+        () => {
+          unsettled.delete(msg.id);
+          notifyWork(); // it is retryable again — no need to wait out a long idle sleep
+        },
       );
     }
   }
@@ -247,7 +343,7 @@ export async function processMessage(msg: MessageRow, gateDeps: WhatsAppGateDeps
   // specific one) and when SMS itself is currently paused.
   if (!success && channel === 'whatsapp' && !forcedChannel && config.sms.enabled && !isPaused('sms')) {
     try {
-      await withTimeout(sendViaChannel('sms', msg.recipient, text), SEND_TIMEOUT_MS);
+      await withTimeout(gateDeps.send('sms', msg.recipient, text), sendTimeoutMs);
       success = true;
       channel = 'sms';
     } catch (err) {
@@ -258,31 +354,53 @@ export async function processMessage(msg: MessageRow, gateDeps: WhatsAppGateDeps
 
   if (success) {
     recordSuccess(channel);
-    markSent(msg.id, channel, variantIndex);
+    recordSentOrRemember(msg.id, channel, variantIndex, false);
     return true;
   }
 
   const attemptsNow = msg.attempts + 1;
-  if (attemptsNow >= MAX_SEND_ATTEMPTS) {
+  if (permanent || attemptsNow >= MAX_SEND_ATTEMPTS) {
     markFailedPermanently(msg.id, lastError ?? 'unknown_error');
   } else {
-    recordFailedAttempt(msg.id, channel, lastError ?? 'unknown_error');
+    const retryInMs = RETRY_DELAYS_MS[Math.min(attemptsNow, RETRY_DELAYS_MS.length) - 1];
+    recordFailedAttempt(msg.id, channel, lastError ?? 'unknown_error', retryInMs);
   }
   return true; // خرجت إلى الشبكة وفشلت — تستحق المباعدة مثل الناجحة تماماً
 }
 
+let stopping = false;
+let current: Promise<unknown> = Promise.resolve();
+
 export function startWorker(): void {
+  stopping = false;
   void loop();
+}
+
+/**
+ * Stops taking new messages and resolves once the one being sent right now
+ * (if any) has finished — so a restart does not cut a send off halfway and
+ * leave a delivered message pending, to be sent again after the restart.
+ * The loop itself winds down on its own; nothing waits for its pacing sleep.
+ */
+export async function stopWorker(): Promise<void> {
+  stopping = true;
+  notifyWork(); // cut an idle sleep short
+  await current.catch(() => {});
 }
 
 async function loop(): Promise<void> {
   let idleDelay = IDLE_MIN_DELAY_MS;
+  let signalAtTickStart = workSignals();
   const backOff = async (): Promise<void> => {
+    // Work arrived while this tick was busy — its wake-up found nobody
+    // sleeping. Look again now instead of sleeping through it.
+    if (workSignals() !== signalAtTickStart) return;
     await sleepUnlessWoken(idleDelay);
     idleDelay = Math.min(idleDelay * 2, IDLE_MAX_DELAY_MS);
   };
 
-  for (;;) {
+  while (!stopping) {
+    signalAtTickStart = workSignals();
     // The whole tick is guarded: startWorker() does `void loop()`, so a throw
     // anywhere in here (getPendingBatch()/getConnectionState() hitting a full
     // disk or a locked db, or anything else unanticipated) used to reject
@@ -300,6 +418,19 @@ async function loop(): Promise<void> {
   }
 
   async function runOneTick(): Promise<void> {
+    // Housekeeping must not stop the sending. On a full disk both of these
+    // throw — and that is exactly when deliveries still going out (and being
+    // remembered in `unrecorded`) matter; aborting the tick here would stop
+    // every send for as long as the disk stayed full.
+    try {
+      flushUnrecorded();
+      // Before anything that can skip the tick: rows nobody will fetch
+      // (pinned to a blocked channel) must still expire — see expireOverdue.
+      expireOverdue(rowsInFlight());
+    } catch (err) {
+      console.error('[worker] تعذّر تنظيف الطابور في هذه الدورة — الإرسال مستمر', err);
+    }
+
     // Nothing can go out at all while the only configured channel is down.
     // Without this the loop would still walk the whole batch just to skip
     // every row. عودة واتساب تستدعي notifyWork() فتقطع هذا الانتظار فوراً.
@@ -340,9 +471,14 @@ async function loop(): Promise<void> {
     // out of the batch, so they cannot fill it and hide the rows behind them
     // (see getPendingBatch). Only a filter on what is FETCHED — the
     // per-message gate in processMessage stays the authority on what is sent.
+    //
+    // SMS counts as blocked only while PAUSED. With no provider at all, a row
+    // forced onto SMS can never go out, and fetching it is what lets
+    // processMessage drop it (no_channel_available) instead of leaving it
+    // pending forever.
     const blockedForced: Channel[] = [];
     if (!getConnectionState().connected || enforcement || !rateAllowed || isPaused('whatsapp')) blockedForced.push('whatsapp');
-    if (!config.sms.enabled || isPaused('sms')) blockedForced.push('sms');
+    if (config.sms.enabled && isPaused('sms')) blockedForced.push('sms');
 
     const batch = getPendingBatch(config.queue.sendBatchSize, blockedForced); // plan 9, point 3
     if (batch.length === 0) {
@@ -352,14 +488,18 @@ async function loop(): Promise<void> {
 
     let sentAnything = false;
     for (const msg of batch) {
+      if (stopping) return;
       let attempted = false;
       try {
-        attempted = await processMessage(msg);
+        const work = processMessage(msg);
+        current = work;
+        attempted = await work;
       } catch (err) {
         console.error(`[worker] unexpected error processing message ${msg.id}`, err);
       }
       if (attempted) {
         sentAnything = true;
+        if (stopping) return;
         await sleep(randomDelay()); // plan 5, point 3 — human-like pacing
       }
     }
