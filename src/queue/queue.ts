@@ -115,8 +115,14 @@ const markSentIfPendingStmt = db.prepare(
   `UPDATE messages SET status = 'sent', channel = ?, template_variant = ?, dropped_unsent = 0, updated_at = datetime('now')
    WHERE id = ? AND status = 'pending'`,
 );
+// Counts the attempt it closes, like recordAttemptStmt: without that, a message
+// that went out five times and failed five times showed `attempts: 4` on
+// /status. `status = 'pending'` because an EARLIER attempt that timed out may
+// have landed while this one was in flight (markSentIfStillPending) — that row
+// was delivered, and must not be rewritten as failed.
 const markFailedStmt = db.prepare(
-  `UPDATE messages SET status = 'failed', last_error = ?, updated_at = datetime('now') WHERE id = ?`,
+  `UPDATE messages SET status = 'failed', attempts = attempts + 1, channel = ?, last_error = ?, updated_at = datetime('now')
+   WHERE id = ? AND status = 'pending'`,
 );
 // `attempts = 0` is what makes "never left" true: a row with earlier network
 // attempts behind it may have been delivered by a send that timed out on our
@@ -144,8 +150,8 @@ export function markSentIfStillPending(id: number, channel: Channel, templateVar
   return Number(markSentIfPendingStmt.run(channel, templateVariant, id).changes) === 1;
 }
 
-export function markFailedPermanently(id: number, error: string): void {
-  markFailedStmt.run(error, id);
+export function markFailedPermanently(id: number, channel: Channel, error: string): void {
+  markFailedStmt.run(channel, error, id);
 }
 
 /**

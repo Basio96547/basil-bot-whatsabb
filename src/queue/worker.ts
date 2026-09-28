@@ -264,7 +264,7 @@ export async function processMessage(msg: MessageRow, gateDeps: WhatsAppGateDeps
 
   const attemptsNow = msg.attempts + 1;
   if (attemptsNow >= MAX_SEND_ATTEMPTS) {
-    markFailedPermanently(msg.id, lastError ?? 'unknown_error');
+    markFailedPermanently(msg.id, channel, lastError ?? 'unknown_error');
   } else {
     recordFailedAttempt(msg.id, channel, lastError ?? 'unknown_error');
   }

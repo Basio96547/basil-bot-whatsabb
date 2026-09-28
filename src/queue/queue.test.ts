@@ -25,7 +25,7 @@ process.env.PROJECT_API_KEY_FIREWORKS ??= 'test-fireworks-key';
 process.env.OTP_HASH_SECRET ??= 'test-otp-hash-secret';
 process.env.SESSION_BACKUP_ENCRYPTION_KEY ??= 'test-passphrase-for-backup-roundtrip';
 
-const { enqueue } = await import('./queue.ts');
+const { enqueue, recordFailedAttempt, markFailedPermanently, markSentIfStillPending } = await import('./queue.ts');
 const { db } = await import('../db.ts');
 
 function clear(): void {
@@ -66,4 +66,40 @@ test('a message queues normally while under both caps', () => {
   const result = enqueue({ project: 'tenant-a', event: 'order_created', recipient: '963900000004', payload: {} });
   assert.equal(result.ok, true);
   assert.equal(typeof (result as { id: number }).id, 'number');
+});
+
+function queued(): number {
+  const result = enqueue({ project: 'tenant-a', event: 'order_created', recipient: '963900000005', payload: {} });
+  assert.equal(result.ok, true);
+  return (result as { id: number }).id;
+}
+
+// Spread: node:sqlite rows have a null prototype, which deepEqual tells apart.
+function rowOf(id: number): { status: string; attempts: number; channel: string | null; last_error: string | null } {
+  return { ...db.prepare('SELECT status, attempts, channel, last_error FROM messages WHERE id = ?').get(id) } as {
+    status: string;
+    attempts: number;
+    channel: string | null;
+    last_error: string | null;
+  };
+}
+
+// Found by driving a message through the real worker loop against a socket
+// whose every send throws: five sends went out, /status said `attempts: 4`.
+test('the attempt that ends in a permanent failure is counted like every one before it', () => {
+  clear();
+  const id = queued();
+  for (let i = 0; i < 4; i++) recordFailedAttempt(id, 'whatsapp', 'send_failed');
+  markFailedPermanently(id, 'whatsapp', 'send_failed');
+  assert.deepEqual(rowOf(id), { status: 'failed', attempts: 5, channel: 'whatsapp', last_error: 'send_failed' });
+});
+
+test('a permanent failure does not overwrite a row an earlier, late-landing send already marked sent', () => {
+  clear();
+  const id = queued();
+  recordFailedAttempt(id, 'whatsapp', 'timeout');
+  // attempt 1 timed out on our side and lands now, while attempt 2 is in flight
+  assert.equal(markSentIfStillPending(id, 'whatsapp', 0), true);
+  markFailedPermanently(id, 'whatsapp', 'send_failed');
+  assert.equal(rowOf(id).status, 'sent', 'a delivered message was rewritten as failed');
 });
