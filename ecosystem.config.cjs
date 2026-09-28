@@ -44,5 +44,17 @@ module.exports = {
       autorestart: true,
       restart_delay: 3000,
     },
+    {
+      // صيانة كل ساعة (scripts/maintenance.sh): تدوير السجلات قبل أن تملأ
+      // القرص، وتحديث cloudflared مرة في الشهر مع تحقق ورجوع — بدل
+      // --no-autoupdate إلى الأبد. لا عملية مقيمة: يعمل ثوانيَ ويخرج، فيظهر
+      // "stopped" بين الدورات، وpm2 يعيد تشغيله عند كل cron_restart.
+      name: 'maintenance',
+      script: 'scripts/maintenance.sh',
+      interpreter: 'sh',
+      cwd: __dirname,
+      autorestart: false,
+      cron_restart: '17 * * * *',
+    },
   ],
 };
