@@ -32,16 +32,31 @@ const purgeSpentResetTokens = db.prepare(`
      OR (expires_at < datetime('now', '-${RESET_TOKEN_RETENTION_HOURS} hours'))
 `);
 
-export function runRetentionSweep(): { messagesDeleted: number; otpDeleted: number; resetTokensDeleted: number; sendLogDeleted: number } {
+// One row per number ever looked up, kept forever: existence.ts never trusts
+// a row past a week (a negative one past an hour), so anything older is only
+// ever overwritten — never read — and the table grew with every new customer.
+const purgeStaleExistence = db.prepare(`
+  DELETE FROM whatsapp_status_cache WHERE checked_at < datetime('now', '-7 days')
+`);
+
+export function runRetentionSweep(): {
+  messagesDeleted: number;
+  otpDeleted: number;
+  resetTokensDeleted: number;
+  sendLogDeleted: number;
+  existenceDeleted: number;
+} {
   const messagesDeleted = purgeOldMessages.run().changes;
   const otpDeleted = purgeSpentOtp.run().changes;
   const resetTokensDeleted = purgeSpentResetTokens.run().changes;
   const sendLogDeleted = purgeOldSendLog.run().changes;
+  const existenceDeleted = purgeStaleExistence.run().changes;
   return {
     messagesDeleted: Number(messagesDeleted),
     otpDeleted: Number(otpDeleted),
     resetTokensDeleted: Number(resetTokensDeleted),
     sendLogDeleted: Number(sendLogDeleted),
+    existenceDeleted: Number(existenceDeleted),
   };
 }
 
@@ -55,7 +70,7 @@ export function scheduleDailyRetention(): void {
     // failing is not a reason to drop the service; log it and retry tomorrow.
     try {
       const result = runRetentionSweep();
-      console.log(`[retention] deleted ${result.messagesDeleted} old message(s), ${result.otpDeleted} spent OTP code(s), ${result.resetTokensDeleted} spent reset token(s), ${result.sendLogDeleted} old send-log row(s)`);
+      console.log(`[retention] deleted ${result.messagesDeleted} old message(s), ${result.otpDeleted} spent OTP code(s), ${result.resetTokensDeleted} spent reset token(s), ${result.sendLogDeleted} old send-log row(s), ${result.existenceDeleted} stale existence-cache row(s)`);
     } catch (error) {
       console.error('[retention] فشل التنظيف الدوري — سيُعاد غداً', error);
     }

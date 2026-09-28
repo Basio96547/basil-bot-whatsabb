@@ -32,15 +32,35 @@ export function inTransaction<T>(fn: () => T | null): T | null {
   try {
     result = fn();
   } catch (error) {
-    db.exec('ROLLBACK');
+    rollbackQuietly();
     throw error;
   }
   if (result === null) {
     db.exec('ROLLBACK');
     return null;
   }
-  db.exec('COMMIT');
+  try {
+    db.exec('COMMIT');
+  } catch (error) {
+    // A COMMIT that fails (a full disk) can leave the transaction open on
+    // this one shared connection — and then every later BEGIN throws and
+    // every write silently joins a transaction that never commits.
+    rollbackQuietly();
+    throw error;
+  }
   return result;
+}
+
+// On some errors (SQLITE_FULL among them) SQLite has already rolled the
+// transaction back itself, and an explicit ROLLBACK then throws "no
+// transaction is active" — which used to REPLACE the real error on its way
+// out, so a full disk was reported as a rollback bug.
+function rollbackQuietly(): void {
+  try {
+    db.exec('ROLLBACK');
+  } catch {
+    /* already rolled back by SQLite */
+  }
 }
 
 db.exec(`
@@ -191,3 +211,10 @@ addColumnIfMissing('otp_send_log', 'message_id', 'INTEGER');
 // which code was actually used — and only that one may be accepted again
 // during the lost-response grace window in otp.ts.
 addColumnIfMissing('otp_codes', 'matched_at', 'TEXT');
+
+// Migration: when a message that failed an attempt may be tried again. Without
+// it the same oldest row was re-fetched on the very next tick, so a burst of
+// fast transient errors spent all five attempts in about twelve seconds — the
+// same failure that tripped the circuit breaker also killed the message.
+// NULL means "now".
+addColumnIfMissing('messages', 'next_attempt_at', 'TEXT');

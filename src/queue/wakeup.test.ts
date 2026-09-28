@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { notifyWork, sleepUnlessWoken } from './wakeup.ts';
+import { notifyWork, sleepUnlessWoken, workSignals } from './wakeup.ts';
 
 // كل الاختبارات هنا تقيس زمناً، فالحدود متسامحة عمداً: المطلوب إثبات أن
 // الإيقاظ يقطع الانتظار (وليس أنه يقطعه خلال ميلي ثانية بعينها).
@@ -33,4 +33,10 @@ test('الإيقاظ مرتين لا يجعل الانتظار يُحسم مرت
   notifyWork();
   notifyWork(); // الثانية يجب ألا تجد منتظِراً ولا أن ترمي
   await waiting;
+});
+
+test('كل إشارة تُعدّ حتى بلا منتظِر — فيرى العامل عملاً وصل وهو مشغول بدفعة', () => {
+  const before = workSignals();
+  notifyWork();
+  assert.equal(workSignals(), before + 1);
 });

@@ -115,6 +115,11 @@ export function recordEnforcement(enforcement: Enforcement): void {
   upsert.run(enforcement.type, new Date(enforcement.endsAtMs).toISOString().slice(0, 19).replace('T', ' '));
 }
 
+/** WhatsApp said the restriction is over — before its announced end, possibly. */
+export function clearEnforcement(): void {
+  clearRow.run();
+}
+
 /** The active enforcement, or null once its window has passed. */
 export function activeEnforcement(): Enforcement | null {
   const row = selectCurrent.get() as { type: string; ends_at: string } | undefined;

@@ -26,7 +26,7 @@ process.env.PROJECT_API_KEY_FIREWORKS ??= 'test-fireworks-key';
 process.env.OTP_HASH_SECRET ??= 'test-otp-hash-secret';
 process.env.SESSION_BACKUP_ENCRYPTION_KEY ??= 'test-passphrase-for-backup-roundtrip';
 
-const { columnExists, addColumnIfMissing } = await import('./db.ts');
+const { columnExists, addColumnIfMissing, db, inTransaction } = await import('./db.ts');
 
 test('columnExists reports true for a column db.ts already migrated in, false for one that was never added', () => {
   assert.equal(columnExists('otp_codes', 'purpose'), true);
@@ -50,4 +50,29 @@ test('a genuine ALTER TABLE failure still throws instead of being silently swall
   // Not a "duplicate column name" error — the table itself does not exist —
   // so this must propagate, exactly like before this change.
   assert.throws(() => addColumnIfMissing('no_such_table_at_all', 'col', 'TEXT'));
+});
+
+test('a transaction SQLite already rolled back itself surfaces the REAL error, not "no transaction is active"', () => {
+  // SQLITE_FULL (a full disk) makes SQLite roll back on its own; the explicit
+  // ROLLBACK that followed then threw and replaced the real cause.
+  assert.throws(
+    () =>
+      inTransaction(() => {
+        db.exec('ROLLBACK');
+        throw new Error('database or disk is full');
+      }),
+    /database or disk is full/,
+  );
+  // And the connection is usable afterwards — not stuck inside a transaction.
+  assert.equal(inTransaction(() => 1), 1);
+});
+
+test('the retention sweep drops existence-cache rows nobody can read any more, and keeps fresh ones', async () => {
+  const { runRetentionSweep } = await import('./cleanup/retention.ts');
+  db.exec(`DELETE FROM whatsapp_status_cache`);
+  db.exec(`INSERT INTO whatsapp_status_cache (phone, has_whatsapp, checked_at) VALUES
+           ('963900000001', 1, datetime('now', '-8 days')), ('963900000002', 1, datetime('now', '-1 days'))`);
+  assert.equal(runRetentionSweep().existenceDeleted, 1);
+  const left = db.prepare('SELECT phone FROM whatsapp_status_cache').all() as Array<{ phone: string }>;
+  assert.deepEqual(left.map((r) => r.phone), ['963900000002']);
 });

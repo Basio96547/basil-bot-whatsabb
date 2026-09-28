@@ -27,7 +27,8 @@ process.env.PROJECT_API_KEY_FIREWORKS ??= 'test-fireworks-key';
 process.env.OTP_HASH_SECRET ??= 'test-otp-hash-secret';
 process.env.SESSION_BACKUP_ENCRYPTION_KEY ??= 'test-passphrase-for-backup-roundtrip';
 
-const { prepareSession, connectWhatsApp, getConnectionState, isLinkedIdentity, getSocket } = await import('./client.ts');
+const { prepareSession, connectWhatsApp, getConnectionState, isLinkedIdentity, getSocket, sendTextAwaitingAck, WhatsAppRejectedError } =
+  await import('./client.ts');
 
 const AUTH_DIR = path.join(process.env.DATA_DIR, 'auth-session');
 
@@ -50,8 +51,10 @@ test('prepareSession reports "unreadable" for a creds.json that exists but canno
 test('connectWhatsApp aborts BEFORE loading or generating an auth state when creds.json is merely unreadable', async () => {
   // Still the directory-in-place-of-a-file from the previous test. If this
   // guard were missing, connectWhatsApp would proceed to
-  // useAtomicMultiFileAuthState, hit the same EISDIR independently, and fall
-  // back to a blank identity instead of throwing here.
+  // useAtomicMultiFileAuthState and hit the same EISDIR independently. That
+  // read now throws on its own too (it used to fall back to a blank
+  // identity), but this guard is what stops the attempt before it reaches
+  // Baileys at all — asserted here by its own message.
   await assert.rejects(() => connectWhatsApp(), /تعذّرت قراءته مؤقتاً/);
 });
 
@@ -83,4 +86,58 @@ test('during an active WhatsApp restriction, an unpaired identity is not even of
   } finally {
     db.exec('DELETE FROM account_enforcement');
   }
+});
+
+// ---- a send is only a send once WhatsApp's server has acknowledged it ----
+
+/** A stand-in for the two socket methods sendTextAwaitingAck uses. */
+function fakeSocket(ack: (id: string) => { attrs: Record<string, string> } | undefined, opts: { ackBeforeSendResolves?: boolean } = {}) {
+  const waiters = new Map<string, (node: unknown) => void>();
+  const sent: Array<{ jid: string; text: string; messageId: string }> = [];
+  const sock = {
+    user: { id: '963900000000:1@s.whatsapp.net' },
+    waitForMessage: <T>(id: string) =>
+      new Promise<T | undefined>((resolve) => waiters.set(id, resolve as (node: unknown) => void)),
+    sendMessage: async (jid: string, content: { text: string }, options: { messageId: string }) => {
+      sent.push({ jid, text: content.text, messageId: options.messageId });
+      const reply = () => waiters.get(options.messageId)?.(ack(options.messageId));
+      if (opts.ackBeforeSendResolves) reply();
+      else setImmediate(reply);
+      return undefined;
+    },
+  };
+  return { sock: sock as unknown as Parameters<typeof sendTextAwaitingAck>[0], sent };
+}
+
+test('a send resolves once the server acknowledges that very message id', async () => {
+  const { sock, sent } = fakeSocket((id) => ({ attrs: { id, class: 'message' } }));
+  await sendTextAwaitingAck(sock, '963900000001@s.whatsapp.net', 'hi');
+  assert.equal(sent.length, 1);
+  assert.ok(sent[0].messageId, 'the id is chosen up front so the wait can be registered before the send');
+});
+
+test('an ack that arrives before sendMessage itself returns is not missed', async () => {
+  const { sock } = fakeSocket((id) => ({ attrs: { id } }), { ackBeforeSendResolves: true });
+  await sendTextAwaitingAck(sock, '963900000001@s.whatsapp.net', 'hi');
+});
+
+test('a 463 error ack (account restricted) is a permanent rejection, not a success', async () => {
+  const { sock } = fakeSocket((id) => ({ attrs: { id, error: '463' } }));
+  await assert.rejects(
+    () => sendTextAwaitingAck(sock, '963900000001@s.whatsapp.net', 'hi'),
+    (err: unknown) => err instanceof WhatsAppRejectedError && err.permanent && err.code === '463',
+  );
+});
+
+test('another error ack is a failure worth retrying, not a success', async () => {
+  const { sock } = fakeSocket((id) => ({ attrs: { id, error: '479' } }));
+  await assert.rejects(
+    () => sendTextAwaitingAck(sock, '963900000001@s.whatsapp.net', 'hi'),
+    (err: unknown) => err instanceof WhatsAppRejectedError && !err.permanent,
+  );
+});
+
+test('no ack at all (a half-open socket swallowed the stanza) is a failure, not a success', async () => {
+  const { sock } = fakeSocket(() => undefined);
+  await assert.rejects(() => sendTextAwaitingAck(sock, '963900000001@s.whatsapp.net', 'hi'), /no_server_ack/);
 });

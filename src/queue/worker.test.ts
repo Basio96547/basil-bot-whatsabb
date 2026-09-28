@@ -33,8 +33,9 @@ process.env.PROJECT_API_KEY_FIREWORKS ??= 'test-fireworks-key';
 process.env.OTP_HASH_SECRET ??= 'test-otp-hash-secret';
 process.env.SESSION_BACKUP_ENCRYPTION_KEY ??= 'test-passphrase-for-backup-roundtrip';
 
-const { enqueue, getPendingBatch, supersedePending, markSentIfStillPending, markSent } = await import('./queue.ts');
-const { processMessage, defaultGateDeps, withTimeout } = await import('./worker.ts');
+const { enqueue, getPendingBatch, supersedePending, markSentIfStillPending, markSent, markFailedPermanently, expireOverdue } = await import('./queue.ts');
+const { processMessage, defaultGateDeps, withTimeout, flushUnrecorded } = await import('./worker.ts');
+const { WhatsAppRejectedError } = await import('../whatsapp/client.ts');
 const { db } = await import('../db.ts');
 
 function clear(): void {
@@ -231,4 +232,146 @@ test('withTimeout rejects a promise that never settles, instead of hanging forev
 test('withTimeout resolves normally when the underlying promise settles first', async () => {
   const fast = Promise.resolve('ok');
   assert.equal(await withTimeout(fast, 50), 'ok');
+});
+
+// ---- the send path itself, with the network replaced by a recorder ----
+
+type Sent = { channel: string; phone: string };
+
+function recorder(outcome: () => Promise<void> = () => Promise.resolve()) {
+  const calls: Sent[] = [];
+  const deps = {
+    ...alwaysOpen,
+    resolveChannel: async () => 'whatsapp' as const,
+    send: (channel: 'whatsapp' | 'sms', phone: string) => {
+      calls.push({ channel, phone });
+      return outcome();
+    },
+  };
+  return { calls, deps };
+}
+
+function queueOne(recipient: string): { id: number; msg: ReturnType<typeof getPendingBatch>[number] } {
+  clear();
+  const queued = enqueue({ project: 'store', event: 'delivered', recipient, payload: { order: '1' } });
+  const id = (queued as { id: number }).id;
+  const msg = getPendingBatch(10).find((m) => m.id === id)!;
+  return { id, msg };
+}
+
+test('a send that outlives its timeout is not sent again while the first call is still running, and is recorded sent when it lands', async () => {
+  const { id, msg } = queueOne('963900000400');
+  let land!: () => void;
+  const { calls, deps } = recorder(() => new Promise<void>((resolve) => (land = resolve)));
+
+  assert.equal(await processMessage(msg, { ...deps, sendTimeoutMs: 20 }), true);
+  assert.equal(rowOf(id).status, 'pending');
+
+  // The next tick would fetch it again (its retry time is past for this test).
+  db.exec(`UPDATE messages SET next_attempt_at = NULL`);
+  const again = getPendingBatch(10).find((m) => m.id === id)!;
+  assert.equal(await processMessage(again, { ...deps, sendTimeoutMs: 20 }), false);
+  assert.equal(calls.length, 1, 'the first call is still in flight — a second one would be a duplicate');
+
+  land();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(rowOf(id).status, 'sent', 'the late landing is the delivery — recorded, not retried');
+});
+
+test('a failure recorded after a late landing does not overwrite "sent"', () => {
+  const { id } = queueOne('963900000401');
+  markSent(id, 'whatsapp', 0);
+  markFailedPermanently(id, 'late_failure');
+  assert.equal(rowOf(id).status, 'sent');
+});
+
+test('WhatsApp refusing a message as account-restricted (463) fails it at once — no retries that deepen the restriction', async () => {
+  const { id, msg } = queueOne('963900000402');
+  const { calls, deps } = recorder(() => Promise.reject(new WhatsAppRejectedError('463')));
+  await processMessage(msg, deps);
+  const row = rowOf(id);
+  assert.equal(row.status, 'failed');
+  assert.equal(row.attempts, 1, 'the one attempt made is counted');
+  assert.equal(calls.length, 1);
+});
+
+test('a transient failure is retried later, not on the very next tick', async () => {
+  const { id, msg } = queueOne('963900000403');
+  const { deps } = recorder(() => Promise.reject(new Error('Connection Closed')));
+  await processMessage(msg, deps);
+  assert.deepEqual({ status: rowOf(id).status, attempts: rowOf(id).attempts }, { status: 'pending', attempts: 1 });
+  assert.equal(getPendingBatch(10).length, 0, 'held back until its retry time');
+  db.exec(`UPDATE messages SET next_attempt_at = datetime('now', '-1 seconds')`);
+  assert.equal(getPendingBatch(10).length, 1, 'and fetched again once it is due');
+});
+
+test('the fifth failed attempt is recorded as five, not four', async () => {
+  const { id, msg } = queueOne('963900000404');
+  db.exec(`UPDATE messages SET attempts = 4`);
+  const { deps } = recorder(() => Promise.reject(new Error('boom')));
+  await processMessage({ ...msg, attempts: 4 }, deps);
+  assert.deepEqual({ status: rowOf(id).status, attempts: rowOf(id).attempts }, { status: 'failed', attempts: 5 });
+});
+
+test('a WhatsApp lookup that fails puts the message back without spending an attempt', async () => {
+  const { id, msg } = queueOne('963900000405');
+  const { calls, deps } = recorder();
+  await processMessage(msg, { ...deps, resolveChannel: () => Promise.reject(new Error('timeout')) });
+  const row = rowOf(id);
+  assert.deepEqual({ status: row.status, attempts: row.attempts, last_error: row.last_error }, {
+    status: 'pending',
+    attempts: 0,
+    last_error: 'channel_resolution_error',
+  });
+  assert.equal(calls.length, 0);
+  assert.equal(getPendingBatch(10).length, 0, 'deferred, not hammered every tick');
+});
+
+test('an unforced message while disconnected (no SMS) waits without even looking the number up', async () => {
+  const { id, msg } = queueOne('963900000406');
+  let looked = false;
+  const { calls, deps } = recorder();
+  const attempted = await processMessage(msg, {
+    ...deps,
+    isConnected: () => false,
+    resolveChannel: async () => {
+      looked = true;
+      return 'whatsapp';
+    },
+  });
+  assert.equal(attempted, false);
+  assert.equal(looked, false, 'the lookup needs a live socket — it must not run, or spend an attempt, while disconnected');
+  assert.equal(calls.length, 0);
+  assert.deepEqual({ status: rowOf(id).status, attempts: rowOf(id).attempts }, { status: 'pending', attempts: 0 });
+});
+
+test('a message that went out but could not be recorded is never sent again, and is recorded once the database recovers', async () => {
+  const { id, msg } = queueOne('963900000407');
+  const { calls, deps } = recorder();
+  db.exec(`CREATE TEMP TRIGGER refuse_sent BEFORE UPDATE OF status ON messages WHEN NEW.status = 'sent'
+           BEGIN SELECT RAISE(ABORT, 'database or disk is full'); END`);
+  try {
+    assert.equal(await processMessage(msg, deps), true);
+    assert.equal(rowOf(id).status, 'pending');
+    assert.equal(await processMessage(msg, deps), false, 'delivered already — no second copy');
+    assert.equal(calls.length, 1);
+  } finally {
+    db.exec('DROP TRIGGER refuse_sent');
+  }
+  flushUnrecorded();
+  assert.equal(rowOf(id).status, 'sent');
+});
+
+test('rows nobody fetches (pinned to a blocked channel) still expire, but a row with a send in flight is left alone', () => {
+  clear();
+  const pinned = enqueue({ project: 'store', event: 'delivered', recipient: '963900000408', payload: { order: '1' }, channel: 'whatsapp' });
+  const inFlight = enqueue({ project: 'store', event: 'delivered', recipient: '963900000409', payload: { order: '1' } });
+  db.exec(`UPDATE messages SET expires_at = datetime('now', '-1 minutes')`);
+  const pinnedId = (pinned as { id: number }).id;
+  const inFlightId = (inFlight as { id: number }).id;
+
+  assert.equal(expireOverdue([inFlightId]), 1);
+  assert.equal(rowOf(pinnedId).status, 'failed');
+  assert.equal(rowOf(pinnedId).last_error, 'expired_before_send');
+  assert.equal(rowOf(inFlightId).status, 'pending', 'its outcome is not known yet');
 });
