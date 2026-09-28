@@ -1,6 +1,7 @@
 import express, { type ErrorRequestHandler } from 'express';
 import { requireProjectApiKey } from './auth.ts';
 import { router } from './routes.ts';
+import { noteStorageFailure } from '../storageHealth.ts';
 
 // body-parser's own failures (malformed JSON, too large, unsupported charset
 // or encoding) carry a `type` and a 4xx `status`. They used to fall through
@@ -33,6 +34,7 @@ const handleBodyErrors: ErrorRequestHandler = (err, _req, res, next) => {
 // usable form. Registered LAST: error middleware only catches what precedes it.
 const handleUnexpected: ErrorRequestHandler = (err, _req, res, _next) => {
   console.error('[http] خطأ غير متوقع في المعالجة', err);
+  noteStorageFailure(err);
   if (res.headersSent) return;
   res.status(500).json({ error: 'internal_error' });
 };

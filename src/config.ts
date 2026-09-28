@@ -193,6 +193,12 @@ export const config = {
     },
   },
 
+  storage: {
+    // Below this much free space /health reports disk_low (see storageHealth.ts)
+    // — early enough to clear space before SQLite starts refusing writes.
+    diskLowBytes: numberEnv('DISK_LOW_BYTES', 200 * 1024 * 1024),
+  },
+
   queue: {
     maxPending: numberEnv('QUEUE_MAX_PENDING', 5000),
     // Plan 9 point 2 bounded the AGGREGATE queue, shared by every project on

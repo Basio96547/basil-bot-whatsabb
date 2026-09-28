@@ -1,4 +1,5 @@
 import { db } from '../db.ts';
+import { noteStorageFailure } from '../storageHealth.ts';
 
 // Plan 10: finished message log kept 90 days (enough for a "did my
 // confirmation arrive?" dispute); used/expired OTP codes purged within an
@@ -58,6 +59,7 @@ export function scheduleDailyRetention(): void {
       console.log(`[retention] deleted ${result.messagesDeleted} old message(s), ${result.otpDeleted} spent OTP code(s), ${result.resetTokensDeleted} spent reset token(s), ${result.sendLogDeleted} old send-log row(s)`);
     } catch (error) {
       console.error('[retention] فشل التنظيف الدوري — سيُعاد غداً', error);
+      noteStorageFailure(error);
     }
   };
   sweep(); // once at boot, then daily — no external cron needed (plan 10)

@@ -32,15 +32,37 @@ export function inTransaction<T>(fn: () => T | null): T | null {
   try {
     result = fn();
   } catch (error) {
-    db.exec('ROLLBACK');
+    rollbackQuietly();
     throw error;
   }
   if (result === null) {
     db.exec('ROLLBACK');
     return null;
   }
-  db.exec('COMMIT');
+  try {
+    db.exec('COMMIT');
+  } catch (error) {
+    // A failed COMMIT can leave the transaction open (SQLite: "may or may not
+    // be rolled back automatically"). Left open, every later statement on this
+    // one shared connection would silently join it, and the next BEGIN
+    // IMMEDIATE would fail for good.
+    rollbackQuietly();
+    throw error;
+  }
   return result;
+}
+
+// SQLite rolls a transaction back ON ITS OWN for some errors — a full disk
+// among them — and a ROLLBACK with nothing open then throws "cannot rollback -
+// no transaction is active". Thrown from the catch above, that replaced the
+// real cause: every code request on a full disk was logged, and seen by
+// /health, as a rollback error instead of "database or disk is full".
+function rollbackQuietly(): void {
+  try {
+    db.exec('ROLLBACK');
+  } catch {
+    // already rolled back by SQLite itself
+  }
 }
 
 db.exec(`

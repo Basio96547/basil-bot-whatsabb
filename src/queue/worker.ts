@@ -17,6 +17,7 @@ import { isPaused, recordSuccess, recordFailure } from './circuitBreaker.ts';
 import { sleepUnlessWoken } from './wakeup.ts';
 import { checkSendRate } from './sendRate.ts';
 import { activeEnforcement, type Enforcement } from '../whatsapp/enforcement.ts';
+import { noteStorageFailure } from '../storageHealth.ts';
 
 const MAX_SEND_ATTEMPTS = 5;
 const SEND_TIMEOUT_MS = 15_000; // plan 9, point 5
@@ -100,6 +101,7 @@ function recordDelivered(id: number, channel: Channel, variantIndex: number, onl
     return true;
   } catch (err) {
     deliveredUnrecorded.set(id, { channel, variantIndex });
+    noteStorageFailure(err);
     throw err;
   }
 }
@@ -336,6 +338,7 @@ async function loop(): Promise<void> {
       await runOneTick();
     } catch (err) {
       console.error('[worker] خطأ غير متوقع في حلقة العامل — سيُعاد المحاولة بعد تراجع', err);
+      noteStorageFailure(err);
       await backOff();
     }
   }
@@ -402,6 +405,7 @@ async function loop(): Promise<void> {
         attempted = await processMessage(msg);
       } catch (err) {
         console.error(`[worker] unexpected error processing message ${msg.id}`, err);
+        noteStorageFailure(err);
       }
       if (attempted) {
         sentAnything = true;

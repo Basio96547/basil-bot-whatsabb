@@ -458,6 +458,25 @@ test('قرص ممتلئ لحظة تسجيل الإرسال: كل رسالة تص
   assert.deepEqual(counts, [1, 1, 1], `times each customer received the same message: ${counts}`);
 });
 
+test('قرص ممتلئ والطابور فارغ: طلبات الكود تفشل ← /health يقول storage_failing (503)، وأول كتابة ناجحة تُعيده ok', async () => {
+  db.exec(`CREATE TRIGGER e2e_disk_full_insert BEFORE INSERT ON messages
+           BEGIN SELECT RAISE(ABORT, 'database or disk is full'); END`);
+  try {
+    const r = await call('POST', '/otp/request', KEYS.store, { to: phone() });
+    assert.equal(r.status, 500);
+    const h = await call('GET', '/health', KEYS.store);
+    assert.equal(h.status, 503, JSON.stringify(h.json));
+    assert.ok(h.json.reasons.includes('storage_failing'), JSON.stringify(h.json.reasons));
+  } finally {
+    db.exec('DROP TRIGGER e2e_disk_full_insert');
+  }
+  const ok = await call('POST', '/notify', KEYS.store, { event: 'delivered', to: phone(), payload: ORDER });
+  assert.equal(ok.status, 202);
+  await waitStatus(ok.json.id, KEYS.store, 'sent');
+  const h = await call('GET', '/health', KEYS.store);
+  assert.equal(h.status, 200, JSON.stringify(h.json));
+});
+
 // ───────────── ٦) الأخير: فشل دائم ← قاطع الدائرة ─────────────
 test('فشل دائم: ٥ محاولات ← failed، والقناة تُوقف مؤقتاً ويظهر channel_paused في /health', async () => {
   const to = phone();

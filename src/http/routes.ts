@@ -9,6 +9,7 @@ import { inTransaction } from '../db.ts';
 import { checkSendRate } from '../queue/sendRate.ts';
 import { pausedChannels } from '../queue/circuitBreaker.ts';
 import { activeEnforcement } from '../whatsapp/enforcement.ts';
+import { storageStatus } from '../storageHealth.ts';
 
 export const router = Router();
 
@@ -317,6 +318,9 @@ router.get('/status/:id', (req, res) => {
 // it — but a stall does, within minutes.
 const QUEUE_STALL_SECONDS = 10 * 60;
 
+// Worth reporting, not an outage: /health stays 200 with these alone.
+const NOTICE_REASONS = new Set(['session_restored_from_backup', 'disk_low']);
+
 router.get('/health', (_req, res) => {
   const pending = countPending();
   const oldestPendingSeconds = oldestPendingAgeSeconds();
@@ -349,7 +353,13 @@ router.get('/health', (_req, res) => {
   const paused = pausedChannels();
   if (paused.length > 0) reasons.push('channel_paused');
 
-  const degraded = reasons.length > 0 && !(reasons.length === 1 && reasons[0] === 'session_restored_from_backup');
+  // Every check above only READS — a full disk passed all of them while every
+  // /otp/request answered 500. See storageHealth.ts.
+  const storage = storageStatus();
+  if (storage.failing) reasons.push('storage_failing');
+  if (storage.low) reasons.push('disk_low');
+
+  const degraded = reasons.some((r) => !NOTICE_REASONS.has(r));
 
   res.status(degraded ? 503 : 200).json({
     status: degraded ? 'degraded' : 'ok',
@@ -358,6 +368,7 @@ router.get('/health', (_req, res) => {
     queue: { pending, maxPending: config.queue.maxPending, oldestPendingSeconds },
     sendRate: { used: rate.used, limit: rate.limit, warmingUp: rate.warmingUp },
     pausedChannels: paused,
+    storage,
     enforcement: enforcement
       ? { type: enforcement.type, endsAt: new Date(enforcement.endsAtMs).toISOString() }
       : null,
