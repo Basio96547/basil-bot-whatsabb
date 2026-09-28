@@ -3,7 +3,7 @@ import { enqueue, getStatus, countPending, oldestPendingAgeSeconds, supersedePen
 import { generateOtp, verifyOtp, linkOtpMessage, endVerificationGrace } from '../otp/otp.ts';
 import { issueResetToken, validateResetToken } from '../passwordReset/passwordReset.ts';
 import { getConnectionState } from '../whatsapp/client.ts';
-import { knownEvents, missingPlaceholders } from '../templates/templates.ts';
+import { knownEvents, missingPlaceholders, payloadPlaceholders } from '../templates/templates.ts';
 import { config, type ProjectConfig } from '../config.ts';
 import { inTransaction } from '../db.ts';
 import { checkSendRate } from '../queue/sendRate.ts';
@@ -21,6 +21,8 @@ export const router = Router();
 // timeout, five times over, holding the worker each time. A malformed
 // recipient is cheap to reject here and expensive everywhere after.
 export const PHONE_RE = /^[1-9]\d{7,14}$/;
+
+const MAX_PAYLOAD_VALUE_LENGTH = 200;
 
 router.post('/notify', (req, res) => {
   const project = req.project!;
@@ -61,6 +63,21 @@ router.post('/notify', (req, res) => {
     .map(([key]) => key);
   if (badFields.length > 0) {
     res.status(400).json({ error: 'invalid_payload', invalid: badFields });
+    return;
+  }
+
+  // A value that lands in the message is text sent from the brand's own
+  // WhatsApp number. A site that forwards a customer-typed field (a name on
+  // an order form) would otherwise relay whatever that customer wrote —
+  // paragraphs, links — to any number, under the brand's name. No real order
+  // number, amount or name comes near this. Only fields a template actually
+  // uses are checked: anything else in the payload never reaches a message.
+  const tooLong = payloadPlaceholders(event, project.templates).filter((name) => {
+    const value = safePayload[name];
+    return typeof value === 'string' && value.length > MAX_PAYLOAD_VALUE_LENGTH;
+  });
+  if (tooLong.length > 0) {
+    res.status(400).json({ error: 'payload_value_too_long', tooLong, maxLength: MAX_PAYLOAD_VALUE_LENGTH });
     return;
   }
 

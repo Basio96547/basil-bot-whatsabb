@@ -10,6 +10,9 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 process.env.SEND_MAX_PER_HOUR = '';
 // Fallbacks (not overriding a real .env) so this runs on a fresh checkout
@@ -42,4 +45,68 @@ test('the fireworks-store project is reachable by id and carries its own brand n
 
 test('an unregistered project id is not silently found', () => {
   assert.equal(getProjectById('not-a-real-project'), undefined);
+});
+
+test('a numeric env var that parses but makes no sense is refused, not silently used', async () => {
+  const { numberEnv } = await import('./config.ts');
+  const set = (value: string) => {
+    process.env.TEST_NUMBER_ENV = value;
+  };
+  try {
+    set('0');
+    assert.throws(() => numberEnv('TEST_NUMBER_ENV', 20, { min: 1, integer: true }), />= 1/);
+    set('-1');
+    assert.throws(() => numberEnv('TEST_NUMBER_ENV', 20, { min: 1, integer: true }), />= 1/);
+    set('2.5');
+    assert.throws(() => numberEnv('TEST_NUMBER_ENV', 20, { min: 1, integer: true }), /whole number/);
+    set('70000');
+    assert.throws(() => numberEnv('TEST_NUMBER_ENV', 3000, { min: 1, max: 65535 }), /<= 65535/);
+    set('abc');
+    assert.throws(() => numberEnv('TEST_NUMBER_ENV', 20), /must be a number/);
+    set('25');
+    assert.equal(numberEnv('TEST_NUMBER_ENV', 20, { min: 1, integer: true }), 25);
+  } finally {
+    delete process.env.TEST_NUMBER_ENV;
+  }
+});
+
+test('the service listens on loopback unless HOST says otherwise', () => {
+  assert.equal(config.host, process.env.HOST || '127.0.0.1');
+});
+
+// config.ts runs once per process, so a boot with a bad .env is checked the
+// way scripts/preflight.sh checks it: in a child process of its own.
+function bootConfig(env: Record<string, string>): { ok: boolean; stderr: string } {
+  const result = spawnSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', "await import('./src/config.ts')"], {
+    cwd: path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'),
+    env: {
+      ...process.env,
+      PROJECT_API_KEY_STORE: 'k-store-0123456789',
+      PROJECT_API_KEY_QAREEB: 'k-qareeb-0123456789',
+      PROJECT_API_KEY_FIREWORKS: 'k-fireworks-0123456789',
+      OTP_HASH_SECRET: 'test-otp-hash-secret',
+      SESSION_BACKUP_ENCRYPTION_KEY: 'test-passphrase',
+      SEND_MAX_PER_HOUR: '',
+      ...env,
+    },
+    encoding: 'utf-8',
+  });
+  return { ok: result.status === 0, stderr: result.stderr };
+}
+
+test('a project API key still set to the public .env.example placeholder stops the boot', () => {
+  const boot = bootConfig({ PROJECT_API_KEY_FIREWORKS: 'change-me-fireworks-key' });
+  assert.equal(boot.ok, false);
+  assert.match(boot.stderr, /PROJECT_API_KEY_FIREWORKS is still the placeholder/);
+});
+
+test('a send delay range that is upside down stops the boot', () => {
+  const boot = bootConfig({ SEND_MIN_DELAY_MS: '9000', SEND_MAX_DELAY_MS: '3000' });
+  assert.equal(boot.ok, false);
+  assert.match(boot.stderr, /SEND_MAX_DELAY_MS/);
+});
+
+test('the same environment with real values boots', () => {
+  const boot = bootConfig({});
+  assert.equal(boot.ok, true, boot.stderr);
 });

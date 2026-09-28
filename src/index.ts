@@ -17,8 +17,8 @@ async function main() {
   // clean 503 from /health — which is precisely when a monitor needs to reach
   // it. The queue worker tolerates a socket that isn't up yet.
   const app = createServer();
-  app.listen(config.port, () => {
-    console.log(`[boot] الخدمة تستمع على المنفذ ${config.port}`);
+  app.listen(config.port, config.host, () => {
+    console.log(`[boot] الخدمة تستمع على ${config.host}:${config.port}`);
   });
 
   startWorker();

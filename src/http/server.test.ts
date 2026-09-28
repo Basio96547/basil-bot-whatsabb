@@ -309,3 +309,33 @@ test('/status 404s a well-formed id that was never issued', async () => {
   assert.equal(status, 404);
   assert.equal(json.error, 'not_found');
 });
+
+test('an Express-level 400 (an undecodable path) stays a 400 — not a 500 with a stack trace in the log', async () => {
+  const { status, json } = await call('GET', '/status/%');
+  assert.equal(status, 400);
+  assert.equal(json.error, 'bad_request');
+});
+
+test('an unknown route answers JSON, not Express\'s HTML page', async () => {
+  const res = await fetch(`http://127.0.0.1:${port}/no-such-route`, { headers: { authorization: `Bearer ${STORE_KEY}` } });
+  assert.equal(res.status, 404);
+  assert.match(res.headers.get('content-type') ?? '', /application\/json/);
+  assert.deepEqual(await res.json(), { error: 'not_found' });
+  assert.equal(res.headers.get('x-powered-by'), null);
+});
+
+test('/notify refuses an oversized value that would land in the message, but ignores extra fields no template uses', async () => {
+  clear();
+  const long = 'x'.repeat(201);
+  const refused = await call('POST', '/notify', {
+    body: { event: 'delivered', to: '963900002100', payload: { order: '1', name: long } },
+  });
+  assert.equal(refused.status, 400);
+  assert.equal(refused.json.error, 'payload_value_too_long');
+  assert.deepEqual(refused.json.tooLong, ['name']);
+
+  const accepted = await call('POST', '/notify', {
+    body: { event: 'delivered', to: '963900002100', payload: { order: '1', internalNote: long } },
+  });
+  assert.equal(accepted.status, 202, 'a field no template reads never reaches a customer — not our business');
+});
