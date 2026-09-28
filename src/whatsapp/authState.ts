@@ -43,8 +43,21 @@ function withLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
   const next = previous.then(fn, fn);
   // Stored already-caught so one failed write can't poison every later write
   // to the same file; the caller still sees the real rejection via `next`.
-  locks.set(key, next.then(() => undefined, () => undefined));
+  const tail = next.then(() => undefined, () => undefined);
+  locks.set(key, tail);
+  // Dropped once nothing is queued behind it. Every key file ever touched
+  // used to keep its entry for the life of the process — one per pre-key,
+  // session and sender-key id, rotated ones included — a slow leak on a
+  // process that is meant to run for months.
+  void tail.then(() => {
+    if (locks.get(key) === tail) locks.delete(key);
+  });
   return next;
+}
+
+/** Exported for testing: how many files currently hold a lock entry. */
+export function lockCount(): number {
+  return locks.size;
 }
 
 /**

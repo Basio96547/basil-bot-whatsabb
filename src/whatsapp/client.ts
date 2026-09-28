@@ -237,7 +237,18 @@ function scheduleReconnect(delayOverrideMs?: number): void {
 // `state` so /health (and the monitor polling it) can report it.
 // Returns the probe so the caller can decide whether it is even safe to load
 // (or generate) an auth state afterward — see connectWhatsApp's use of it.
-export async function prepareSession(): Promise<CredsProbe> {
+// How many connect attempts in a row may find the session gone and R2
+// unreachable before a fresh identity (a QR) is accepted instead. Going
+// straight to a fresh identity on the FIRST failed download — a boot before
+// the network is fully back — was close to irreversible: Baileys saves the
+// fresh creds.json before any QR is scanned (edge_routing), after which
+// every probe reads 'ok' and the good R2 copy is never tried again. Waiting
+// forever is no better when R2 is down for good, so after this many tries
+// along the backoff ramp (about ten minutes) the QR is offered after all.
+const MAX_R2_RESTORE_RETRIES = 5;
+let r2RestoreFailures = 0;
+
+export async function prepareSession(): Promise<CredsProbe | 'backup_unreachable'> {
   const probe = await probeCreds(authDir);
   // Nothing to repair — leave whatever the last connect concluded in place;
   // only a successful 'open' below clears a previous warning.
@@ -273,11 +284,20 @@ export async function prepareSession(): Promise<CredsProbe> {
 
   const restore = await restoreSessionFromR2();
   if (restore.ok) {
+    r2RestoreFailures = 0;
     state.sessionOrigin = 'restored';
     state.sessionNote = `${problem} — استُعيدت ${restore.files} ملف من نسخة R2`;
     app.info(`[whatsapp] ${state.sessionNote}`);
     return probe;
   }
+
+  if (restore.reason === 'error' && r2RestoreFailures < MAX_R2_RESTORE_RETRIES) {
+    r2RestoreFailures += 1;
+    state.sessionNote = `${problem}، ولا نسخة محلية، وتعذّر الوصول إلى R2 — إعادة المحاولة (${r2RestoreFailures}/${MAX_R2_RESTORE_RETRIES}) قبل قبول هوية جديدة`;
+    app.error(`[whatsapp] ${state.sessionNote}`, restore.error);
+    return 'backup_unreachable';
+  }
+  r2RestoreFailures = 0;
 
   state.sessionNote =
     restore.reason === 'not_configured'
@@ -299,6 +319,11 @@ export function startWhatsApp(): void {
 
 export async function connectWhatsApp(): Promise<void> {
   const probe = await prepareSession();
+  if (probe === 'backup_unreachable') {
+    // Same retry-with-backoff as below, for the same reason: nothing may
+    // mint an identity while the real one might still be one download away.
+    throw new Error('الجلسة مفقودة ونسخة R2 لم تُحمَّل بعد — إعادة المحاولة بدل توليد هوية جديدة');
+  }
   if (probe === 'unreadable') {
     // Do not let useAtomicMultiFileAuthState's own creds read hit this exact
     // transient error independently — see prepareSession's comment. Throwing
