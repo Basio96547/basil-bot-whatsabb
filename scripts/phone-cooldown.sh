@@ -50,8 +50,19 @@ try {
 
 echo ""
 echo "--- هل كان pm2 يقتل الخدمة لتجاوز الذاكرة؟ ---"
-grep -c 'exceeds --max-memory-restart' "$HOME/.pm2/pm2.log" 2>/dev/null | sed 's/^/  عدد مرات القتل المسجّلة: /' || echo "  (لا سجل)"
-grep 'exceeds --max-memory-restart' "$HOME/.pm2/pm2.log" 2>/dev/null | tail -3 | sed 's/^/  /' || true
+# الفحص على وجود الملف لا على `||` بعد أنبوب: حالة الأنبوب حالة sed، فكان
+# «(لا سجل)» لا يُطبع أبداً حين يغيب السجل.
+if [ -f "$HOME/.pm2/pm2.log" ]; then
+  echo "  عدد مرات القتل المسجّلة: $(grep -c 'exceeds --max-memory-restart' "$HOME/.pm2/pm2.log" || true)"
+  grep 'exceeds --max-memory-restart' "$HOME/.pm2/pm2.log" | tail -3 | sed 's/^/  /' || true
+else
+  echo "  (لا سجل)"
+fi
+# والوجه الآخر لنفس المشكلة: --max-old-space-size=256 يجعل V8 نفسه ينهار
+# عند السقف بدل أن يقتله pm2 — ولا يظهر ذلك في pm2.log بل في سجل أخطاء الخدمة.
+if [ -f "$HOME/.pm2/logs/sms-api-error.log" ]; then
+  echo "  انهيارات نفاد كومة V8: $(grep -c 'heap out of memory' "$HOME/.pm2/logs/sms-api-error.log" || true)"
+fi
 
 echo ""
 echo "--- حجم سجلات pm2 (كتابة متواصلة على الذاكرة الفلاشية) ---"
@@ -68,14 +79,21 @@ echo "1) اختبار علم cloudflared قبل الاعتماد عليه"
 # ويُتراجع عنه تلقائياً بدل أن يُكتشف بعد فوات الأوان. العدد يُقرأ من
 # ecosystem.config.cjs نفسه: الاختبار كان مكتوباً بـ"1" بعد أن صار الملف "2"،
 # فصار الرجوع لا يطابق شيئاً ويفشل بصمت.
-ha=$(grep -o -- '--ha-connections [0-9]*' ecosystem.config.cjs | head -1 | grep -o '[0-9]*$' || true)
+#
+# من سطر `args:` وحده: التعليق فوقه يذكر "--ha-connections 2" أيضاً، وكان
+# أول تطابق في الملف هو التعليق لا القيمة الفعلية.
+#
+# والحكم من نص المخرجات لا من رمز الخروج: cloudflared يخرج بـ0 حتى مع علم
+# مجهول ("flag provided but not defined")، فكان الاختبار ينجح دائماً ولا يصل
+# التراجع أبداً.
+ha=$(grep -E '^[[:space:]]*args:' ecosystem.config.cjs | grep -o -- '--ha-connections [0-9]*' | head -1 | grep -o '[0-9]*$' || true)
 if [ -z "$ha" ]; then
   echo "   لا يوجد --ha-connections في الملف — لا شيء لاختباره"
-elif cloudflared tunnel --no-autoupdate --ha-connections "$ha" run --help >/dev/null 2>&1; then
-  echo "   مدعوم — سيُشغَّل بـ $ha اتصال QUIC"
-else
+elif cloudflared tunnel --no-autoupdate --ha-connections "$ha" run --help 2>&1 | grep -q 'not defined'; then
   echo "   غير مدعوم في هذه النسخة — التراجع إلى الصيغة القديمة"
-  sed -i "s/tunnel --no-autoupdate --ha-connections [0-9]* run sms-api/tunnel run sms-api/" ecosystem.config.cjs
+  sed -i "s/tunnel --no-autoupdate --ha-connections [0-9]* run sms-api/tunnel --no-autoupdate run sms-api/" ecosystem.config.cjs
+else
+  echo "   مدعوم — سيُشغَّل بـ $ha اتصال QUIC"
 fi
 
 echo "2) مفاتيح المشاريع، وهل يُقلع الإعداد الجديد؟"
@@ -113,8 +131,11 @@ try cat /proc/loadavg
 
 echo ""
 echo "--- الفحص المحلي ---"
-key=$(grep '^PROJECT_API_KEY_STORE=' .env | cut -d= -f2-)
-curl -s -m 15 -H "Authorization: Bearer $key" http://localhost:3000/health || echo "(الخدمة لم تردّ)"
+# آخر تعريف (dotenv يأخذ الأخير)، وبلا \r أو علامات اقتباس — وإلا ذهبت إلى
+# ترويسة Authorization وردّت الخدمة 401 وكأنها معطّلة.
+key=$(grep '^PROJECT_API_KEY_STORE=' .env | tail -1 | cut -d= -f2- | tr -d '\r"')
+# 127.0.0.1 صراحةً: الخدمة تستمع على الحلقة المحلية (HOST في .env).
+curl -s -m 15 -H "Authorization: Bearer $key" http://127.0.0.1:3000/health || echo "(الخدمة لم تردّ)"
 echo ""
 
 echo ""

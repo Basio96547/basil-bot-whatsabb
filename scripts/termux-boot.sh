@@ -29,8 +29,12 @@ termux-wake-lock
 
 # الشبكة تتأخر بعد الإقلاع (وVPN بعدها) — pm2 resurrect قبلها يعني أن أول
 # محاولة اتصال لكل خدمة تفشل وتدخل التباعد. حتى دقيقتين، ثم نكمل على أي حال.
+#
+# ping بمساره الكامل إن لم يكن على PATH: بيئة Termux:Boot أفقر من الجلسة
+# التفاعلية، وping مفقود كان يعني انتظار الدقيقتين كاملتين في كل إقلاع.
+PING=$(command -v ping || echo /system/bin/ping)
 tries=0
-while [ "$tries" -lt 24 ] && ! ping -c 1 -W 2 1.1.1.1 >/dev/null 2>&1; do
+while [ "$tries" -lt 24 ] && ! "$PING" -c 1 -W 2 1.1.1.1 >/dev/null 2>&1; do
   tries=$((tries + 1))
   sleep 5
 done
