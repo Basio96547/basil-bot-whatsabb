@@ -365,24 +365,23 @@ export async function processMessage(msg: MessageRow, gateDeps: WhatsAppGateDeps
 }
 
 let stopping = false;
-let running: Promise<void> | null = null;
 let current: Promise<unknown> = Promise.resolve();
 
 export function startWorker(): void {
   stopping = false;
-  running = loop();
+  void loop();
 }
 
 /**
  * Stops taking new messages and resolves once the one being sent right now
  * (if any) has finished — so a restart does not cut a send off halfway and
  * leave a delivered message pending, to be sent again after the restart.
+ * The loop itself winds down on its own; nothing waits for its pacing sleep.
  */
 export async function stopWorker(): Promise<void> {
   stopping = true;
   notifyWork(); // cut an idle sleep short
   await current.catch(() => {});
-  await running;
 }
 
 async function loop(): Promise<void> {
