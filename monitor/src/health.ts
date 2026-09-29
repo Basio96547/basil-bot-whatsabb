@@ -15,6 +15,12 @@ export interface Observation {
   reasons: string[];
   /** Extra facts worth showing (an enforcement end time, the HTTP code). */
   detail: string | null;
+  /**
+   * The monitor has no API key, so "ok" only means the service answered at
+   * all — the phone, the tunnel and the Node process are up. WhatsApp's own
+   * state stays unseen until SMS_API_KEY is set.
+   */
+  limited?: boolean;
 }
 
 export interface MonitorState {
@@ -52,6 +58,7 @@ export const REMIND_EVERY_MS = 6 * 60 * 60_000;
 const REASON_TEXT: Record<string, string> = {
   unreachable: 'الخدمة لا تردّ إطلاقاً — الجوال مطفأ أو بلا إنترنت',
   tunnel_down: 'Cloudflare لا يجد النفق — cloudflared متوقف على الجوال أو الجوال بلا شبكة',
+  gateway_error: 'Cloudflare لم يتلقَّ ردّاً من الخدمة — sms-api متوقفة أو تنهار وتعيد التشغيل على الجوال (pm2 status)، أو الشبكة تنقطع',
   auth_failed: 'مفتاح المراقب مرفوض — حدّث السر SMS_API_KEY للمراقب',
   whatsapp_needs_reauth: 'جلسة واتساب انتهت — يحتاج مسح QR جديد',
   whatsapp_disconnected: 'واتساب مقطوع — يعيد المحاولة وحده',
@@ -68,6 +75,7 @@ function describe(reason: string): string {
 
 interface HealthBody {
   status?: unknown;
+  error?: unknown;
   reasons?: unknown;
   enforcement?: { endsAt?: unknown } | null;
 }
@@ -83,9 +91,10 @@ function parseJson(text: string): HealthBody | null {
 
 /**
  * What one request to /health says. `httpStatus` is null when the request
- * itself failed (no route to the phone, a timeout).
+ * itself failed (no route to the phone, a timeout). `keyConfigured` is false
+ * while the monitor has no SMS_API_KEY to send.
  */
-export function classify(httpStatus: number | null, bodyText: string, fetchError?: string): Observation {
+export function classify(httpStatus: number | null, bodyText: string, fetchError?: string, keyConfigured = true): Observation {
   if (httpStatus === null) {
     return { status: 'bad', reasons: ['unreachable'], detail: fetchError ?? null };
   }
@@ -102,10 +111,23 @@ export function classify(httpStatus: number | null, bodyText: string, fetchError
       detail: endsAt ? `القيد ينتهي ${endsAt}` : null,
     };
   }
-  if (httpStatus === 401) return { status: 'bad', reasons: ['auth_failed'], detail: null };
-  // Anything else in the 5xx range is Cloudflare's edge speaking, not the
-  // service — 530 / error 1033 is "no tunnel connector".
-  if (httpStatus >= 500) return { status: 'bad', reasons: ['tunnel_down'], detail: `HTTP ${httpStatus}` };
+  if (httpStatus === 401) {
+    // Without a key the service's own refusal is still an answer: it proves
+    // the phone is on, the tunnel is up and Node is serving — which is most
+    // of what this monitor exists to catch. The key lives only on the phone,
+    // so this is how the monitor runs until someone copies it over.
+    if (!keyConfigured && body?.error === 'invalid_or_missing_api_key') {
+      return { status: 'ok', reasons: [], detail: null, limited: true };
+    }
+    return { status: 'bad', reasons: ['auth_failed'], detail: null };
+  }
+  // Anything else in the 5xx range is Cloudflare speaking, not the service.
+  // 530 (error 1033) is "no tunnel connector": cloudflared is not connected.
+  // The rest — 502 above all — is what cloudflared answers when nothing
+  // listens on 127.0.0.1:3000: the tunnel is fine and sms-api is not. Telling
+  // them apart says which pm2 app to look at.
+  if (httpStatus === 530) return { status: 'bad', reasons: ['tunnel_down'], detail: `HTTP ${httpStatus}` };
+  if (httpStatus >= 500) return { status: 'bad', reasons: ['gateway_error'], detail: `HTTP ${httpStatus}` };
   return { status: 'bad', reasons: [`unexpected_http_${httpStatus}`], detail: bodyText.slice(0, 120) || null };
 }
 
@@ -129,6 +151,15 @@ function reasonLines(obs: Observation): string {
 function makeAlert(kind: AlertKind, obs: Observation, since: number, now: number): Alert {
   switch (kind) {
     case 'started':
+      if (obs.status === 'ok' && obs.limited) {
+        return {
+          kind,
+          priority: 3,
+          title: 'مراقب sms-api يعمل (وضع محدود)',
+          message:
+            'الفحص كل 5 دقائق بدأ، والخدمة تردّ الآن. بلا مفتاح API يكشف المراقب انطفاء الجوال وسقوط النفق وتوقف الخدمة، لا حالة واتساب. لإكماله: شغّل monitor/setup.ps1 من الكمبيوتر والجوال موصول.',
+        };
+      }
       return obs.status === 'ok'
         ? { kind, priority: 3, title: 'مراقب sms-api يعمل', message: 'الفحص كل 5 دقائق بدأ، والخدمة سليمة الآن. ستصلك رسالة عند أي مشكلة ثابتة وعند التعافي منها.' }
         : { kind, priority: 5, title: 'مراقب sms-api يعمل — والخدمة فيها مشكلة الآن', message: reasonLines(obs) };
