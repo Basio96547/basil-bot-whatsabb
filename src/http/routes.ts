@@ -353,8 +353,7 @@ router.get('/health', (_req, res) => {
   const paused = pausedChannels();
   if (paused.length > 0) reasons.push('channel_paused');
 
-  // Every check above only READS — a full disk passed all of them while every
-  // /otp/request answered 500. See storageHealth.ts.
+  // Every check above only reads — see storageHealth.ts.
   const storage = storageStatus();
   if (storage.failing) reasons.push('storage_failing');
   if (storage.low) reasons.push('disk_low');

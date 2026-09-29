@@ -1,16 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import path from 'node:path';
+import { useTestEnv } from './testEnv.ts';
 
-process.env.DATA_DIR = mkdtempSync(path.join(tmpdir(), 'sms-api-storage-'));
+useTestEnv('storage');
 process.env.DISK_LOW_BYTES = '1000';
-process.env.PROJECT_API_KEY_STORE ??= 'test-store-key';
-process.env.PROJECT_API_KEY_QAREEB ??= 'test-qareeb-key';
-process.env.PROJECT_API_KEY_FIREWORKS ??= 'test-fireworks-key';
-process.env.OTP_HASH_SECRET ??= 'test-otp-hash-secret';
-process.env.SESSION_BACKUP_ENCRYPTION_KEY ??= 'test-passphrase-for-backup-roundtrip';
 
 const { noteStorageFailure, noteStorageSuccess, storageStatus, freeDiskBytes } = await import('./storageHealth.ts');
 

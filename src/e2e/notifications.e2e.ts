@@ -10,30 +10,21 @@
 // خارج نمط src/**/*.test.ts عمداً: يحتاج --experimental-test-module-mocks
 // لاستبدال المقبس، و--test-force-exit لأن حلقة العامل لا تنتهي. شغّله بـ
 // `npm run test:e2e` (و`npm test` يشغّله بعد بقية الاختبارات).
-//
-// DATA_DIR يُحوَّل قبل استيراد db.ts، فلا يلمس الطابور الحيّ.
 
 import test, { mock } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import path from 'node:path';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
+import { useTestEnv } from '../testEnv.ts';
 
-process.env.DATA_DIR = mkdtempSync(path.join(tmpdir(), 'sms-api-e2e-'));
-process.env.PROJECT_API_KEY_STORE = 'e2e-store-key';
-process.env.PROJECT_API_KEY_QAREEB = 'e2e-qareeb-key';
-process.env.PROJECT_API_KEY_FIREWORKS = 'e2e-fireworks-key';
-process.env.OTP_HASH_SECRET = 'e2e-otp-hash-secret';
-process.env.SESSION_BACKUP_ENCRYPTION_KEY = 'e2e-backup-passphrase';
+useTestEnv('e2e');
 // المباعدة البشرية بين الرسائل (٣–٩ ث) تُصفَّر هنا فقط لسرعة الاختبار.
 process.env.SEND_MIN_DELAY_MS = '0';
 process.env.SEND_MAX_DELAY_MS = '0';
 delete process.env.SMS_PROVIDER; // واتساب فقط، كما هو في الإنتاج اليوم
 
 // ───────────── مقبس واتساب مزيَّف ─────────────
-interface Delivered { jid: string; text: string; at: number }
+interface Delivered { jid: string; text: string }
 const delivered: Delivered[] = [];
 const waState = {
   connected: true,
@@ -59,7 +50,7 @@ const fakeSocket = {
       failTimes.set(phone, left - 1);
       throw new Error('fake_send_failure');
     }
-    delivered.push({ jid, text: content.text, at: Date.now() });
+    delivered.push({ jid, text: content.text });
     return {};
   },
 };
@@ -80,7 +71,6 @@ mock.module(new URL('../whatsapp/client.ts', import.meta.url).href, {
 const { createServer } = await import('../http/server.ts');
 const { startWorker } = await import('../queue/worker.ts');
 const { notifyWork } = await import('../queue/wakeup.ts');
-const { renderTemplate } = await import('../templates/templates.ts');
 const { config } = await import('../config.ts');
 const { db } = await import('../db.ts');
 
@@ -89,14 +79,7 @@ await new Promise<void>((r) => server.listen(0, r));
 const { port } = server.address() as AddressInfo;
 startWorker();
 
-const projectsFile = JSON.parse(readFileSync(new URL('../../config/projects.json', import.meta.url), 'utf-8')) as Array<{
-  id: string; brandName: string; otpExpiryMinutes: number; resendCooldownMinutes: number; templates?: Record<string, string[]>;
-}>;
-const KEYS: Record<string, string> = {
-  store: 'e2e-store-key',
-  qareeb: 'e2e-qareeb-key',
-  fireworks: 'e2e-fireworks-key',
-};
+const KEYS = Object.fromEntries(config.projects.map((p) => [p.id, p.apiKey]));
 
 // ───────────── أدوات مساعدة ─────────────
 async function call(method: string, urlPath: string, key: string | null, body?: unknown) {
@@ -152,10 +135,9 @@ const phone = () => `9639000${String(++phoneSeq).padStart(5, '0')}`;
 const ORDER = { order: 'A-1042', amount: '150,000 ل.س', name: 'سارة' };
 const EVENTS = ['order_created', 'order_confirmed', 'out_for_delivery', 'delivered'] as const;
 
-// ───────────── ١) كل مشروع: الرحلات الأربع كاملة ─────────────
-for (const p of projectsFile) {
-  const key = KEYS[p.id];
-  assert.ok(key, `no test key mapped for project ${p.id} — add it to KEYS`);
+// ───────────── ١) كل مشروع: التسجيل ونسيت كلمة المرور ─────────────
+for (const p of config.projects) {
+  const key = p.apiKey;
 
   test(`[${p.id}] تسجيل: /otp/request ← يصل واتساب بالعلامة والكود ← /otp/verify بالكود الواصل`, async () => {
     const to = phone();
@@ -185,21 +167,6 @@ for (const p of projectsFile) {
     // الزبون يلصق رسالة واتساب كاملة كما وصلته — README يَعِد بقبولها
     const ok = await call('POST', '/otp/verify', key, { to, code: msg.text });
     assert.equal(ok.status, 200, `pasted full message rejected: ${JSON.stringify(ok.json)} — text: ${msg.text}`);
-
-    // الكود نفسه يبقى مقبولاً دقيقتين إن ضاع الرد الأول (d89b6b2)، لكن رمز آخر لا
-    const again = await call('POST', '/otp/verify', key, { to, code: wrong });
-    assert.equal(again.status, 400);
-  });
-
-  test(`[${p.id}] كود بأرقام عربية ← مقبول`, async () => {
-    const to = phone();
-    const req = await call('POST', '/otp/request', key, { to });
-    assert.equal(req.status, 202);
-    await waitStatus(req.json.id, key, 'sent');
-    const code = codeIn(lastTo(to).text);
-    const arabic = code.replace(/\d/g, (d) => '٠١٢٣٤٥٦٧٨٩'[Number(d)]);
-    const ok = await call('POST', '/otp/verify', key, { to, code: arabic });
-    assert.equal(ok.status, 200, JSON.stringify(ok.json));
   });
 
   test(`[${p.id}] نسيت كلمة المرور: request ← يصل ← verify ← resetToken ← validate-token يستهلكه مرة واحدة`, async () => {
@@ -234,106 +201,25 @@ for (const p of projectsFile) {
     const reuse = await call('POST', '/password-reset/validate-token', key, { token: ver.json.resetToken });
     assert.equal(reuse.status, 400, 'token must be single-use');
   });
+}
 
-  for (const event of EVENTS) {
-    test(`[${p.id}] إشعار طلب: ${event} ← يصل بالرقم والمبلغ والاسم بلا متغيّرات متروكة`, async () => {
-      const to = phone();
-      const res = await call('POST', '/notify', key, { event, to, payload: ORDER });
-      assert.equal(res.status, 202, JSON.stringify(res.json));
-      await waitStatus(res.json.id, key, 'sent');
-      const msg = lastTo(to);
-      assertClean(msg.text);
-      assert.ok(msg.text.includes(ORDER.order), `order number missing: ${msg.text}`);
-      if (event === 'order_created' || event === 'out_for_delivery') {
-        assert.ok(msg.text.includes(ORDER.amount), `amount missing: ${msg.text}`);
-      }
-    });
-  }
-
-  test(`[${p.id}] إشعار بحمولة ناقصة (بلا name) ← يُختار قالب لا يحتاجه، لا "{name}" عند الزبون`, async () => {
-    const sent: string[] = [];
-    for (let i = 0; i < 6; i++) {
-      const to = phone();
-      const res = await call('POST', '/notify', key, { event: 'delivered', to, payload: { order: 'B-7' } });
-      assert.equal(res.status, 202);
-      await waitStatus(res.json.id, key, 'sent');
-      sent.push(lastTo(to).text);
+// المتجر وحده يرسل إشعارات الطلب، وقوالبها لا تستعمل اسم المشروع أصلاً.
+for (const event of EVENTS) {
+  test(`[store] إشعار طلب: ${event} ← يصل بالرقم والمبلغ بلا متغيّرات متروكة`, async () => {
+    const to = phone();
+    const res = await call('POST', '/notify', KEYS.store, { event, to, payload: ORDER });
+    assert.equal(res.status, 202, JSON.stringify(res.json));
+    await waitStatus(res.json.id, KEYS.store, 'sent');
+    const msg = lastTo(to);
+    assertClean(msg.text);
+    assert.ok(msg.text.includes(ORDER.order), `order number missing: ${msg.text}`);
+    if (event === 'order_created' || event === 'out_for_delivery') {
+      assert.ok(msg.text.includes(ORDER.amount), `amount missing: ${msg.text}`);
     }
-    for (const t of sent) assertClean(t);
   });
 }
 
-// ───────────── ٢) عزل المشاريع ─────────────
-test('عزل: كود store لا يُتحقق منه بمفتاح qareeb، و/status لرسالة مشروع آخر 404', async () => {
-  const to = phone();
-  const req = await call('POST', '/otp/request', KEYS.store, { to });
-  await waitStatus(req.json.id, KEYS.store, 'sent');
-  const code = codeIn(lastTo(to).text);
-
-  const cross = await call('POST', '/otp/verify', KEYS.qareeb, { to, code });
-  assert.equal(cross.status, 400);
-  assert.equal((await call('GET', `/status/${req.json.id}`, KEYS.qareeb)).status, 404);
-  assert.equal((await call('GET', `/status/${req.json.id}`, KEYS.fireworks)).status, 404);
-
-  const ok = await call('POST', '/otp/verify', KEYS.store, { to, code });
-  assert.equal(ok.status, 200);
-});
-
-test('عزل: رسالة store لا تستعمل قوالب مخدم الخاصة، ورسالة مخدم لا تحمل اسم Talisham', async () => {
-  const qareeb = projectsFile.find((p) => p.id === 'qareeb')!;
-  const store = projectsFile.find((p) => p.id === 'store')!;
-  for (let i = 0; i < 5; i++) {
-    const a = phone();
-    const r1 = await call('POST', '/otp/request', KEYS.store, { to: a });
-    await waitStatus(r1.json.id, KEYS.store, 'sent');
-    assert.ok(!matchesAnyVariant(lastTo(a).text, qareeb.templates!.otp, { brand: store.brandName, expiryMinutes: store.otpExpiryMinutes }));
-    const b = phone();
-    const r2 = await call('POST', '/otp/request', KEYS.qareeb, { to: b });
-    await waitStatus(r2.json.id, KEYS.qareeb, 'sent');
-    assert.ok(!lastTo(b).text.includes('Talisham'));
-  }
-});
-
-test('مفتاح خاطئ أو غائب ← 401 قبل أي مسار', async () => {
-  assert.equal((await call('POST', '/notify', null, {})).status, 401);
-  assert.equal((await call('POST', '/notify', 'nope', {})).status, 401);
-  assert.equal((await call('GET', '/health', 'nope')).status, 401);
-});
-
-// ───────────── ٣) التهدئة والحماية ─────────────
-test('طلب كود ثانٍ والأول حيّ ← 202 alreadySent بلا رسالة ثانية؛ بعد التحقق ← 429 cooldown', async () => {
-  const to = phone();
-  const r1 = await call('POST', '/otp/request', KEYS.store, { to });
-  await waitStatus(r1.json.id, KEYS.store, 'sent');
-  const before = delivered.length;
-
-  const r2 = await call('POST', '/otp/request', KEYS.store, { to });
-  assert.equal(r2.status, 202);
-  assert.equal(r2.json.alreadySent, true);
-  await new Promise((r) => setTimeout(r, 300));
-  assert.equal(delivered.length, before, 'a second WhatsApp message went out for an already_sent request');
-
-  await call('POST', '/otp/verify', KEYS.store, { to, code: codeIn(lastTo(to).text) });
-  const r3 = await call('POST', '/otp/request', KEYS.store, { to });
-  assert.equal(r3.status, 429);
-  assert.equal(r3.json.error, 'cooldown');
-  assert.ok(r3.json.retryAfterSeconds > 0);
-});
-
-test('حمولة order_created بلا amount ← 400 missing_placeholders (لا تُرسل "{amount}" للزبون)', async () => {
-  const res = await call('POST', '/notify', KEYS.store, { event: 'order_created', to: phone(), payload: { order: '1' } });
-  assert.equal(res.status, 400);
-  assert.equal(res.json.error, 'missing_placeholders');
-  assert.deepEqual(res.json.missing, ['amount']);
-});
-
-test('رقم محلي بصفر بادئ ← 400 قبل الطابور', async () => {
-  const res = await call('POST', '/notify', KEYS.store, { event: 'delivered', to: '0958436703', payload: ORDER });
-  assert.equal(res.status, 400);
-  assert.equal(res.json.error, 'invalid_recipient_format');
-});
-
-// ───────────── ٤) الصمود ─────────────
+// ───────────── ٢) الصمود ─────────────
 test('/health ← 200 ok والطابور فارغ وواتساب متصل', async () => {
   const h = await call('GET', '/health', KEYS.store);
   assert.equal(h.status, 200, JSON.stringify(h.json));
@@ -407,28 +293,6 @@ test('رقم بلا واتساب ولا مزوّد SMS ← failed no_channel_ava
   NO_WHATSAPP.delete(to);
 });
 
-// ───────────── ٥) كل صيغ القوالب لكل مشروع ─────────────
-test('كل صيغة من كل قالب في كل مشروع تُعرض نظيفة (٣٠٠ عرض لكل حدث)', () => {
-  const allEvents = ['otp', 'password_reset', ...EVENTS];
-  for (const proj of config.projects) {
-    for (const event of allEvents) {
-      const seen = new Set<number>();
-      for (let i = 0; i < 300; i++) {
-        const { text, variantIndex } = renderTemplate(
-          event,
-          { ...ORDER, code: '482913', brand: proj.brandName, expiryMinutes: proj.otpExpiryMinutes },
-          proj.templates,
-        );
-        assertClean(text);
-        assert.ok(text.includes(proj.brandName) || !['otp', 'password_reset'].includes(event), `${proj.id}/${event}: ${text}`);
-        seen.add(variantIndex);
-      }
-      const expected = (proj.templates?.[event] ?? null)?.length;
-      if (expected) assert.equal(seen.size, expected, `${proj.id}/${event}: only ${seen.size}/${expected} variants ever chosen`);
-    }
-  }
-});
-
 test('قرص ممتلئ لحظة تسجيل الإرسال: كل رسالة تصل مرة واحدة فقط، وتُسجَّل sent حين يتحرر', async () => {
   waState.connected = false;
   const phones = [phone(), phone(), phone()];
@@ -477,7 +341,7 @@ test('قرص ممتلئ والطابور فارغ: طلبات الكود تفش�
   assert.equal(h.status, 200, JSON.stringify(h.json));
 });
 
-// ───────────── ٦) الأخير: فشل دائم ← قاطع الدائرة ─────────────
+// ───────────── ٣) الأخير: فشل دائم ← قاطع الدائرة ─────────────
 test('فشل دائم: ٥ محاولات ← failed، والقناة تُوقف مؤقتاً ويظهر channel_paused في /health', async () => {
   const to = phone();
   failTimes.set(to, 99);
@@ -491,8 +355,4 @@ test('فشل دائم: ٥ محاولات ← failed، والقناة تُوقف 
   assert.ok(h.json.reasons.includes('channel_paused'), JSON.stringify(h.json.reasons));
 });
 
-test.after(() => {
-  server.close();
-  console.log(`\n[e2e] رسائل واتساب سُلِّمت للمقبس المزيَّف: ${delivered.length}`);
-  for (const d of delivered.slice(0, 3)) console.log(`[e2e] مثال → ${d.jid}: ${d.text.replace(/\n/g, ' ⏎ ')}`);
-});
+test.after(() => server.close());

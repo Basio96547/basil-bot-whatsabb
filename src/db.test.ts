@@ -5,26 +5,12 @@
 // and is what actually decides; these pin that it works, that it is
 // idempotent, and that a real failure still throws instead of being
 // swallowed.
-//
-// DATA_DIR is redirected before db.ts is imported so this runs against a
-// throwaway SQLite file, never the live queue.
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import path from 'node:path';
+import { useTestEnv } from './testEnv.ts';
 
-process.env.DATA_DIR = mkdtempSync(path.join(tmpdir(), 'sms-api-db-'));
-// db.ts imports config.ts, which requires one of these per project in
-// config/projects.json at import time, unrelated to anything this file
-// actually tests — on a fresh checkout with no .env yet, this file failed
-// before a single test ran.
-process.env.PROJECT_API_KEY_STORE ??= 'test-store-key';
-process.env.PROJECT_API_KEY_QAREEB ??= 'test-qareeb-key';
-process.env.PROJECT_API_KEY_FIREWORKS ??= 'test-fireworks-key';
-process.env.OTP_HASH_SECRET ??= 'test-otp-hash-secret';
-process.env.SESSION_BACKUP_ENCRYPTION_KEY ??= 'test-passphrase-for-backup-roundtrip';
+useTestEnv('db');
 
 const { columnExists, addColumnIfMissing, inTransaction, db } = await import('./db.ts');
 

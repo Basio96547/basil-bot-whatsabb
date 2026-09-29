@@ -13,25 +13,13 @@
 //    the check blocked fetching the batch AT ALL — including SMS-bound
 //    messages, which have nothing to do with either check. They are now
 //    read per message, right before a WhatsApp attempt.
-//
-// DATA_DIR is redirected before db.ts is imported so this runs against a
-// throwaway SQLite file, never the live queue.
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync } from 'node:fs';
-import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { useTestEnv } from '../testEnv.ts';
 
-process.env.DATA_DIR = mkdtempSync(path.join(tmpdir(), 'sms-api-worker-'));
-// config.ts requires one of these per project in config/projects.json at
-// import time, unrelated to anything this file actually tests — on a fresh
-// checkout with no .env yet, this file failed before a single test ran.
-process.env.PROJECT_API_KEY_STORE ??= 'test-store-key';
-process.env.PROJECT_API_KEY_QAREEB ??= 'test-qareeb-key';
-process.env.PROJECT_API_KEY_FIREWORKS ??= 'test-fireworks-key';
-process.env.OTP_HASH_SECRET ??= 'test-otp-hash-secret';
-process.env.SESSION_BACKUP_ENCRYPTION_KEY ??= 'test-passphrase-for-backup-roundtrip';
+useTestEnv('worker');
 
 const { enqueue, getPendingBatch, supersedePending, markSentIfStillPending, markSent } = await import('./queue.ts');
 const { processMessage, defaultGateDeps, withTimeout } = await import('./worker.ts');

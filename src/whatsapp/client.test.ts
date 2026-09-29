@@ -7,29 +7,18 @@
 // (including this exact transient one) into a blank identity — which the
 // very next creds.update then saves over the real session. connectWhatsApp
 // must now abort the whole attempt instead, before ever touching Baileys.
-//
-// DATA_DIR is redirected before config.ts (and everything importing it) is
-// loaded so this runs against a throwaway auth folder, never the real one.
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync } from 'node:fs';
 import path from 'node:path';
+import { useTestEnv } from '../testEnv.ts';
 
-process.env.DATA_DIR = mkdtempSync(path.join(tmpdir(), 'sms-api-client-'));
-// config.ts requires one of these per project in config/projects.json at
-// import time, unrelated to anything this file actually tests — on a fresh
-// checkout with no .env yet, this file failed before a single test ran.
-process.env.PROJECT_API_KEY_STORE ??= 'test-store-key';
-process.env.PROJECT_API_KEY_QAREEB ??= 'test-qareeb-key';
-process.env.PROJECT_API_KEY_FIREWORKS ??= 'test-fireworks-key';
-process.env.OTP_HASH_SECRET ??= 'test-otp-hash-secret';
-process.env.SESSION_BACKUP_ENCRYPTION_KEY ??= 'test-passphrase-for-backup-roundtrip';
+const dataDir = useTestEnv('client');
 
 const { prepareSession, connectWhatsApp, getConnectionState, isLinkedIdentity, getSocket } = await import('./client.ts');
 
-const AUTH_DIR = path.join(process.env.DATA_DIR, 'auth-session');
+const AUTH_DIR = path.join(dataDir, 'auth-session');
 
 test('prepareSession reports "missing" when there is no session and nothing to restore from', async () => {
   assert.equal(await prepareSession(), 'missing');

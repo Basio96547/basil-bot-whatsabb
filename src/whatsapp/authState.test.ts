@@ -5,14 +5,21 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readdirSync, writeFileSync, readFileSync } from 'node:fs';
+import { mkdtempSync, readdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { initAuthCreds } from '@whiskeysockets/baileys';
 import { probeCreds, useAtomicMultiFileAuthState } from './authState.ts';
 
+const folders: string[] = [];
+test.after(() => {
+  for (const folder of folders) rmSync(folder, { recursive: true, force: true });
+});
+
 function freshFolder(): string {
-  return mkdtempSync(path.join(tmpdir(), 'sms-api-auth-'));
+  const folder = mkdtempSync(path.join(tmpdir(), 'sms-api-auth-'));
+  folders.push(folder);
+  return folder;
 }
 
 test('probeCreds distinguishes a missing session from a corrupt one', async () => {

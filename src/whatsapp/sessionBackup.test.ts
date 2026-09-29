@@ -2,34 +2,21 @@
 // credentials at all, so its two dangerous edges get tested directly: it must
 // not restore from an unreadable backup, and a re-snapshot must not leave
 // deleted keys behind to be restored later as stale signal state.
-//
-// DATA_DIR is redirected to a throwaway folder BEFORE config.ts is imported —
-// these functions resolve their paths once at module load, and the real
-// data/auth-session holds a live WhatsApp login that must never be touched by
-// a test run.
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync, existsSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync, existsSync } from 'node:fs';
 import path from 'node:path';
+import { useTestEnv } from '../testEnv.ts';
 
-process.env.DATA_DIR = mkdtempSync(path.join(tmpdir(), 'sms-api-backup-'));
+const dataDir = useTestEnv('backup');
 
-process.env.SESSION_BACKUP_ENCRYPTION_KEY ??= 'test-passphrase-for-backup-roundtrip';
 // Fake but well-formed — makes config.sessionBackup.enabled true so
 // quarantineDeadSession's R2 branch is exercised below, using injected
 // stand-ins rather than a real S3Client, which none of these tests have.
 process.env.R2_ACCOUNT_ID ??= 'test-account';
 process.env.R2_ACCESS_KEY_ID ??= 'test-access-key';
 process.env.R2_SECRET_ACCESS_KEY ??= 'test-secret';
-// config.ts requires one of these per project in config/projects.json at
-// import time, unrelated to anything this file actually tests — on a fresh
-// checkout with no .env yet, this file failed before a single test ran.
-process.env.PROJECT_API_KEY_STORE ??= 'test-store-key';
-process.env.PROJECT_API_KEY_QAREEB ??= 'test-qareeb-key';
-process.env.PROJECT_API_KEY_FIREWORKS ??= 'test-fireworks-key';
-process.env.OTP_HASH_SECRET ??= 'test-otp-hash-secret';
 
 const {
   snapshotLocal,
@@ -44,7 +31,7 @@ const {
 const crypto = await import('node:crypto');
 const zlib = await import('node:zlib');
 
-const AUTH_DIR = path.join(process.env.DATA_DIR, 'auth-session');
+const AUTH_DIR = path.join(dataDir, 'auth-session');
 const BUNDLE = `${AUTH_DIR}-backup.enc`;
 // The pre-bundle local format — a directory holding a plain copy of every file.
 const LEGACY_DIR = `${AUTH_DIR}-backup`;

@@ -10,15 +10,11 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { useTestEnv } from './testEnv.ts';
 
 process.env.SEND_MAX_PER_HOUR = '';
-// Fallbacks (not overriding a real .env) so this runs on a fresh checkout
-// with no .env yet too — config.ts requires all of these at import time.
-process.env.PROJECT_API_KEY_STORE ??= 'test-store-key';
-process.env.PROJECT_API_KEY_QAREEB ??= 'test-qareeb-key';
-process.env.PROJECT_API_KEY_FIREWORKS ??= 'test-fireworks-key';
-process.env.OTP_HASH_SECRET ??= 'test-otp-hash-secret';
-process.env.SESSION_BACKUP_ENCRYPTION_KEY ??= 'test-passphrase-for-backup-roundtrip';
+useTestEnv('config');
 
 const { getProjectById, config } = await import('./config.ts');
 
@@ -27,7 +23,8 @@ test('a blank (empty-string) numeric env var falls back to its documented defaul
 });
 
 test('every project registered in config/projects.json loads with a real API key', () => {
-  for (const id of ['store', 'qareeb', 'fireworks']) {
+  const registered = JSON.parse(readFileSync(new URL('../config/projects.json', import.meta.url), 'utf-8')) as Array<{ id: string }>;
+  for (const { id } of registered) {
     const project = getProjectById(id);
     assert.ok(project, `project "${id}" did not load`);
     assert.ok(project!.apiKey.length > 0, `project "${id}" has no API key`);
