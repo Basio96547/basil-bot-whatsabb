@@ -104,7 +104,7 @@ export async function deliver(env: Env, alert: Alert, fetcher: typeof fetch = fe
     );
   }
   if (sends.length === 0) {
-    console.error('[monitor] لا توجد قناة تنبيه — اضبط NTFY_TOPIC أو TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID');
+    console.error('[monitor] لا توجد قناة تنبيه — اضبط TELEGRAM_BOT_TOKEN و TELEGRAM_CHAT_ID (monitor/setup.ps1)');
     return false;
   }
   const results = await Promise.allSettled(sends);
