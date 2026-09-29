@@ -4,3 +4,6 @@ data/
 auth-session/
 .env
 *.log
+.dev.vars
+.wrangler/
+monitor/.ntfy-topic

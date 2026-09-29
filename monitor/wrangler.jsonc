@@ -1,0 +1,16 @@
+// مراقب sms-api — Worker بلا أي رابط عام: يعمل على جدول Cron فقط.
+// النشر من هذا المجلد: npm install ثم npx wrangler deploy (README، القسم ٩).
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "sms-api-monitor",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-01",
+  // لا workers.dev ولا روابط معاينة: لا أحد يحتاج أن يطلبه من الخارج.
+  "workers_dev": false,
+  "preview_urls": false,
+  "triggers": { "crons": ["*/5 * * * *"] },
+  "vars": { "HEALTH_URL": "https://sms-api.talisham.com/health" },
+  // حالة آخر فحص (هل أُعلنت المشكلة؟ منذ متى؟) — أُنشئ في حساب Cloudflare باسم sms-api-monitor-state.
+  "kv_namespaces": [{ "binding": "STATE", "id": "a9832d77159f4f998e247b3e1f93e52f" }],
+  "observability": { "enabled": true }
+}
