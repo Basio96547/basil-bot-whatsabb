@@ -1,8 +1,8 @@
-﻿# يركّب مراقب sms-api على Cloudflare ويربطه بتنبيهات ntfy — من الكمبيوتر.
+﻿# يركّب مراقب sms-api على Cloudflare ويربطه بتنبيهات تيليجرام — من الكمبيوتر.
 #
 #   powershell -ExecutionPolicy Bypass -File "C:\Users\PC\sms-api-new\monitor\setup.ps1"
 #
-# آمن للتكرار: إعادة تشغيله تنشر آخر نسخة وتُبقي نفس موضوع التنبيهات.
+# آمن للتكرار: إعادة تشغيله تنشر آخر نسخة، وEnter عند سؤال تيليجرام يُبقي ضبطه.
 # يحتاج الجوال موصولاً بـ USB مرة واحدة فقط، لقراءة مفتاح API من .env الجوال.
 
 $ErrorActionPreference = 'Stop'
@@ -46,33 +46,34 @@ if (-not $key) {
 if (-not $key) { throw 'لا مفتاح — لا يمكن للمراقب قراءة /health' }
 Write-Host '  وُجد المفتاح'
 
-Write-Host '=== 3) موضوع التنبيهات (ntfy) ===' -ForegroundColor Cyan
-# الموضوع هو كلمة السر الوحيدة لقناة ntfy: من يعرفه يقرأ التنبيهات. عشوائي،
-# ويُحفظ هنا (خارج git) كي لا يتغيّر مع كل تشغيل فينقطع اشتراكك.
-$topicFile = Join-Path $PSScriptRoot '.ntfy-topic'
-if (Test-Path $topicFile) {
-    $topic = (Get-Content $topicFile -Raw).Trim()
-} else {
-    # الـ Worker قد يكون منشوراً من مكان آخر (جلسة سحابية، كمبيوتر ثانٍ) بموضوع
-    # تشترك فيه فعلاً. توليد موضوع جديد هنا كان سيستبدله بصمت: لا خطأ، فقط
-    # تنبيهات تذهب إلى موضوع لا يسمعه أحد.
-    Write-Host '  إن كنت مشتركاً في موضوع ntfy للمراقب فالصقه، وإلا اضغط Enter لتوليد موضوع جديد:' -ForegroundColor Yellow
-    $topic = (Read-Host '  الموضوع').Trim()
-    if ($topic -and $topic -notmatch '^[A-Za-z0-9_-]{1,64}$') { throw "موضوع غير صالح: $topic" }
-    if (-not $topic) {
-        $bytes = New-Object byte[] 12
-        [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
-        $topic = 'sms-api-' + (($bytes | ForEach-Object { $_.ToString('x2') }) -join '')
-    }
-    Set-Content -Path $topicFile -Value $topic -NoNewline
+Write-Host '=== 3) قناة التنبيهات (تيليجرام) ===' -ForegroundColor Cyan
+# لا ntfy.sh: من شبكة Cloudflare يرفض الاتصال (522) أو يردّ 429 «نفدت الحصة
+# اليومية» — عناوين Workers الصادرة مشتركة بين الجميع، فحصّة ntfy المجانية لكل
+# عنوان تُستهلك قبل أول تنبيه (مقيس في 2026-09-29). تيليجرام يردّ من نفس المكان.
+$secrets = @{ SMS_API_KEY = $key }
+Write-Host '  أنشئ بوتاً: في تيليجرام افتح @BotFather ← /newbot ← انسخ التوكن الذي يعطيك إياه.'
+Write-Host '  الصق التوكن هنا، أو اضغط Enter إن كان تيليجرام مضبوطاً من قبل:' -ForegroundColor Yellow
+$botToken = (Read-Host '  التوكن').Trim()
+if ($botToken) {
+    try { $me = Invoke-RestMethod "https://api.telegram.org/bot$botToken/getMe" }
+    catch { throw 'تيليجرام رفض التوكن — انسخه كاملاً من رسالة @BotFather' }
+    Write-Host "  أرسل الآن أي رسالة إلى @$($me.result.username) في تيليجرام، ثم اضغط Enter هنا" -ForegroundColor Yellow
+    Read-Host | Out-Null
+    # معرّف المحادثة لا يُعرف إلا من رسالة وصلت البوت: هكذا يعرف إلى من يرسل.
+    $updates = Invoke-RestMethod "https://api.telegram.org/bot$botToken/getUpdates"
+    $chat = $updates.result | ForEach-Object { $_.message.chat } | Where-Object { $_ } | Select-Object -Last 1
+    if (-not $chat) { throw "لم تصل رسالة إلى @$($me.result.username) بعد — أرسل له رسالة وأعد تشغيل السكربت" }
+    $secrets.TELEGRAM_BOT_TOKEN = $botToken
+    $secrets.TELEGRAM_CHAT_ID = [string]$chat.id
+    Write-Host "  التنبيهات ستصل إلى: $($chat.first_name) $($chat.last_name)"
 }
-Write-Host "  $topic"
 
 Write-Host '=== 4) النشر ===' -ForegroundColor Cyan
 Invoke-Native npx wrangler deploy
 # الأسرار بعد النشر لا قبله: secret put على Worker غير موجود يسأل سؤالاً
-# تفاعلياً. وعبر stdin لا ملف مؤقت: المفتاح لا يُكتب على القرص.
-(@{ SMS_API_KEY = $key; NTFY_TOPIC = $topic } | ConvertTo-Json -Compress) | npx wrangler secret bulk
+# تفاعلياً. وعبر stdin لا ملف مؤقت: المفتاح لا يُكتب على القرص. وما لم يُدخل
+# (تيليجرام المضبوط سابقاً) لا يُرسل، فيبقى كما هو.
+($secrets | ConvertTo-Json -Compress) | npx wrangler secret bulk
 if ($LASTEXITCODE -ne 0) { throw 'تعذّر حفظ الأسرار في Cloudflare' }
 
 Write-Host '=== 5) تشغيل الساعة ===' -ForegroundColor Cyan
@@ -83,7 +84,5 @@ Write-Host '  تعمل — فحص كل ٥ دقائق'
 
 Write-Host ''
 Write-Host '=== تم ===' -ForegroundColor Green
-Write-Host '  اشترك في التنبيهات على جوالك (ويفضَّل على الكمبيوتر أيضاً — الجوال نفسه قد يكون ما سقط):'
-Write-Host "    تطبيق ntfy ← + ← الموضوع: $topic"
-Write-Host "    أو في المتصفح: https://ntfy.sh/$topic"
-Write-Host '  خلال ٥ دقائق يصلك «مراقب sms-api يعمل». إن لم يصل: npx wrangler tail sms-api-monitor'
+Write-Host '  خلال ٥ دقائق يصلك في تيليجرام «مراقب sms-api يعمل» (إن لم يكن قد وصل من قبل).'
+Write-Host '  إن لم يصل: npx wrangler tail sms-api-monitor'

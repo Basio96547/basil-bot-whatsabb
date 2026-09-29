@@ -1,5 +1,6 @@
 // مراقب sms-api: Worker على Cloudflare يفحص /health كل ٥ دقائق من الخارج —
-// من نفس الطريق الذي تسلكه المواقع — ويرسل تنبيهاً عبر ntfy و/أو تيليجرام.
+// من نفس الطريق الذي تسلكه المواقع — ويرسل تنبيهاً عبر تيليجرام (أو خادم ntfy
+// خاص؛ ntfy.sh العام لا يصلح من هنا — السبب عند deliver أدناه).
 //
 // من خارج الجوال عمداً: أكثر ما يجب أن يُكشف هو أن الجوال نفسه انطفأ، أو فقد
 // الشبكة، أو أن النفق سقط — ومراقب يعمل على الجوال يسقط معه في كل ذلك.
@@ -70,6 +71,11 @@ export async function observe(env: Env, fetcher: typeof fetch = fetch): Promise<
 export async function deliver(env: Env, alert: Alert, fetcher: typeof fetch = fetch): Promise<boolean> {
   const sends: Array<Promise<Response>> = [];
   if (env.NTFY_TOPIC) {
+    // Only with NTFY_SERVER pointing at a server of your own. The public
+    // ntfy.sh is unusable from Workers (measured 2026-09-29): connections die
+    // with 522, and those that land get 429 "daily message quota reached" —
+    // its free quota is per source IP, and Workers' outbound IPs are shared
+    // with everyone else on Cloudflare.
     // JSON publishing, not headers: an Arabic title in an HTTP header is not
     // valid ISO-8859-1 and fetch refuses it.
     sends.push(
