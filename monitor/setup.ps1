@@ -53,9 +53,17 @@ $topicFile = Join-Path $PSScriptRoot '.ntfy-topic'
 if (Test-Path $topicFile) {
     $topic = (Get-Content $topicFile -Raw).Trim()
 } else {
-    $bytes = New-Object byte[] 12
-    [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
-    $topic = 'sms-api-' + (($bytes | ForEach-Object { $_.ToString('x2') }) -join '')
+    # الـ Worker قد يكون منشوراً من مكان آخر (جلسة سحابية، كمبيوتر ثانٍ) بموضوع
+    # تشترك فيه فعلاً. توليد موضوع جديد هنا كان سيستبدله بصمت: لا خطأ، فقط
+    # تنبيهات تذهب إلى موضوع لا يسمعه أحد.
+    Write-Host '  إن كنت مشتركاً في موضوع ntfy للمراقب فالصقه، وإلا اضغط Enter لتوليد موضوع جديد:' -ForegroundColor Yellow
+    $topic = (Read-Host '  الموضوع').Trim()
+    if ($topic -and $topic -notmatch '^[A-Za-z0-9_-]{1,64}$') { throw "موضوع غير صالح: $topic" }
+    if (-not $topic) {
+        $bytes = New-Object byte[] 12
+        [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+        $topic = 'sms-api-' + (($bytes | ForEach-Object { $_.ToString('x2') }) -join '')
+    }
     Set-Content -Path $topicFile -Value $topic -NoNewline
 }
 Write-Host "  $topic"
@@ -66,6 +74,12 @@ Invoke-Native npx wrangler deploy
 # تفاعلياً. وعبر stdin لا ملف مؤقت: المفتاح لا يُكتب على القرص.
 (@{ SMS_API_KEY = $key; NTFY_TOPIC = $topic } | ConvertTo-Json -Compress) | npx wrangler secret bulk
 if ($LASTEXITCODE -ne 0) { throw 'تعذّر حفظ الأسرار في Cloudflare' }
+
+Write-Host '=== 5) تشغيل الساعة ===' -ForegroundColor Cyan
+# لا Cron (الخطة المجانية بلغت حدّها): أول منبّه يُسلَّح بطلب واحد لرابط الـ Worker.
+# الطلب لا يفعل شيئاً إن كانت الساعة تعمل، فتكراره مع كل نشر آمن.
+Invoke-WebRequest -Uri 'https://sms-api-monitor.basil0552106933.workers.dev' -Method Post -UseBasicParsing | Out-Null
+Write-Host '  تعمل — فحص كل ٥ دقائق'
 
 Write-Host ''
 Write-Host '=== تم ===' -ForegroundColor Green

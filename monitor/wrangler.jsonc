@@ -1,16 +1,21 @@
-// مراقب sms-api — Worker بلا أي رابط عام: يعمل على جدول Cron فقط.
-// النشر من هذا المجلد: npm install ثم npx wrangler deploy (README، القسم ٩).
+// مراقب sms-api — Worker ساعته منبّه Durable Object لا Cron (السبب أعلى src/index.ts).
+// النشر من هذا المجلد: npm install ثم npx wrangler deploy، ثم طلب واحد لرابطه يشغّل الساعة
+// (monitor/setup.ps1 يفعل الثلاثة — README، القسم ٩).
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "sms-api-monitor",
   "main": "src/index.ts",
   "compatibility_date": "2026-09-01",
-  // لا workers.dev ولا روابط معاينة: لا أحد يحتاج أن يطلبه من الخارج.
-  "workers_dev": false,
+  // رابط workers.dev ضروري الآن: لا Cron يبدأ السلسلة، فأول منبّه يُسلَّح بطلب
+  // من الخارج. الطلب لا يكشف شيئاً ولا يغيّر شيئاً إن كانت الساعة تعمل.
+  "workers_dev": true,
   "preview_urls": false,
-  "triggers": { "crons": ["*/5 * * * *"] },
+  // فارغ صراحةً: الحساب بلغ حدّ ٥ جداول Cron في الخطة المجانية (الرمز 10072).
+  "triggers": { "crons": [] },
   "vars": { "HEALTH_URL": "https://sms-api.talisham.com/health" },
   // حالة آخر فحص (هل أُعلنت المشكلة؟ منذ متى؟) — أُنشئ في حساب Cloudflare باسم sms-api-monitor-state.
   "kv_namespaces": [{ "binding": "STATE", "id": "a9832d77159f4f998e247b3e1f93e52f" }],
+  "durable_objects": { "bindings": [{ "name": "SCHEDULER", "class_name": "Scheduler" }] },
+  "exports": { "Scheduler": { "type": "durable-object", "storage": "sqlite" } },
   "observability": { "enabled": true }
 }

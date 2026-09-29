@@ -4,6 +4,10 @@
 // من خارج الجوال عمداً: أكثر ما يجب أن يُكشف هو أن الجوال نفسه انطفأ، أو فقد
 // الشبكة، أو أن النفق سقط — ومراقب يعمل على الجوال يسقط معه في كل ذلك.
 //
+// الساعة منبّه Durable Object لا Cron: الحساب على خطة Workers المجانية، وحدّها
+// ٥ جداول Cron للحساب كله، وكلها مشغولة بمشاريع أخرى (رُفض النشر بالرمز 10072
+// في 2026-09-29). المنبّه يعيد تسليح نفسه كل فحص ولا يحتاج خانة Cron.
+//
 // الإعداد والنشر: README.md، القسم ٩.
 
 import { classify, decide, stateAfterFailedDelivery, type Alert, type MonitorState, type Observation } from './health.ts';
@@ -15,9 +19,24 @@ interface KV {
   put(key: string, value: string): Promise<void>;
 }
 
+// The slice of the Durable Object runtime this uses — declared, like KV above,
+// so nothing here imports `cloudflare:workers` and the tests run under Node.
+interface AlarmStorage {
+  get<T>(key: string): Promise<T | undefined>;
+  put(key: string, value: unknown): Promise<void>;
+  getAlarm(): Promise<number | null>;
+  setAlarm(scheduledTime: number): Promise<void>;
+}
+
+interface SchedulerNamespace {
+  idFromName(name: string): unknown;
+  get(id: unknown): { fetch(input: string, init?: RequestInit): Promise<Response> };
+}
+
 export interface Env {
   HEALTH_URL: string;
   STATE: KV;
+  SCHEDULER: SchedulerNamespace;
   /** Secrets (npx wrangler secret put …). */
   SMS_API_KEY?: string;
   NTFY_TOPIC?: string;
@@ -29,16 +48,21 @@ export interface Env {
 const STATE_KEY = 'state';
 const CHECK_TIMEOUT_MS = 20_000;
 const SEND_TIMEOUT_MS = 10_000;
+export const CHECK_EVERY_MS = 5 * 60_000;
+// Alarms are at-least-once: a rare duplicate firing seconds after the real one
+// would count as a second failed check and halve the "two checks" patience.
+const MIN_GAP_MS = 60_000;
 
 export async function observe(env: Env, fetcher: typeof fetch = fetch): Promise<Observation> {
+  const key = env.SMS_API_KEY?.trim();
   try {
     const response = await fetcher(env.HEALTH_URL, {
-      headers: { Authorization: `Bearer ${env.SMS_API_KEY ?? ''}` },
+      headers: key ? { Authorization: `Bearer ${key}` } : {},
       signal: AbortSignal.timeout(CHECK_TIMEOUT_MS),
     });
-    return classify(response.status, await response.text());
+    return classify(response.status, await response.text(), undefined, Boolean(key));
   } catch (err) {
-    return classify(null, '', err instanceof Error ? err.message : String(err));
+    return classify(null, '', err instanceof Error ? err.message : String(err), Boolean(key));
   }
 }
 
@@ -102,8 +126,43 @@ export async function runCheck(env: Env, now = Date.now(), fetcher: typeof fetch
   if (toSave && JSON.stringify(toSave) !== raw) await env.STATE.put(STATE_KEY, JSON.stringify(toSave));
 }
 
+/**
+ * The clock: one Durable Object whose alarm fires every 5 minutes and runs a
+ * check. It re-arms itself BEFORE checking and never throws, so neither a
+ * failed check nor a failed alert can break the chain.
+ */
+export class Scheduler {
+  constructor(
+    private readonly state: { storage: AlarmStorage },
+    private readonly env: Env,
+    private readonly fetcher: typeof fetch = fetch,
+  ) {}
+
+  /** Arms the chain if it is not armed; a no-op otherwise. */
+  async fetch(): Promise<Response> {
+    if ((await this.state.storage.getAlarm()) === null) await this.state.storage.setAlarm(Date.now() + 1_000);
+    return new Response(null, { status: 204 });
+  }
+
+  async alarm(): Promise<void> {
+    const now = Date.now();
+    await this.state.storage.setAlarm(now + CHECK_EVERY_MS);
+    const lastRunAt = (await this.state.storage.get<number>('lastRunAt')) ?? 0;
+    if (now - lastRunAt < MIN_GAP_MS) return;
+    await this.state.storage.put('lastRunAt', now);
+    try {
+      await runCheck(this.env, now, this.fetcher);
+    } catch (err) {
+      console.error('[monitor] فشل الفحص', err);
+    }
+  }
+}
+
 export default {
-  async scheduled(_controller: unknown, env: Env): Promise<void> {
-    await runCheck(env);
+  // The only way to start the chain from outside (no cron slot to do it):
+  // any request arms it if it is not armed, and reveals nothing. setup.ps1
+  // calls it after every deploy; opening the URL in a browser does the same.
+  async fetch(_request: Request, env: Env): Promise<Response> {
+    return env.SCHEDULER.get(env.SCHEDULER.idFromName('clock')).fetch('https://scheduler/arm', { method: 'POST' });
   },
 };
