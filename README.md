@@ -236,7 +236,40 @@ powershell -ExecutionPolicy Bypass -File "C:\Users\PC\sms api\scripts\push-to-ph
 `whatsapp_needs_reauth` صار يعني فعلاً «يحتاج QR»: كان يظهر مع كل إعادة اتصال
 عادية لأن الفحص قرأ `creds.registered` — وBaileys لا يضبطه إلا لربط بكود لا بـQR.
 
-كان يستعلمه ووركر `khidam` كل 5 دقائق عبر Cron Trigger ويدفع إشعار Web Push للمشرفين **عند تغيّر الحالة فقط** (`src/lib/healthMonitor.ts` في مستودع khidam.com). **ذلك الووركر حُذف في 2026-09-20** حين انتقل النطاق khidam.com إلى mokhdam-app (تحقّقتُ: `wrangler deployments list --name khidam` → "This Worker does not exist")، فلا شيء يراقب هذه الخدمة الآن إلا إن نُقل المراقب إلى ووركر حيّ.
+### المراقب: `monitor/` (Worker على Cloudflare)
+
+كان يستعلمه ووركر `khidam`، وحُذف مع نقل khidam.com إلى mokhdam-app في 2026-09-20. بديله
+هنا في `monitor/`: Worker باسم `sms-api-monitor` يطلب `/health` كل 5 دقائق **من خارج
+الجوال** — من نفس الطريق الذي تسلكه المواقع — ويرسل تنبيهاً عبر [ntfy](https://ntfy.sh)
+(وتيليجرام اختيارياً). من الخارج عمداً: أهم ما يجب كشفه أن الجوال انطفأ أو فقد الشبكة أو
+سقط النفق، ومراقب على الجوال يسقط معه.
+
+**التركيب** — من الكمبيوتر، والجوال موصول بـ USB (لقراءة مفتاح API من `.env` الجوال مرة واحدة):
+
+```
+powershell -ExecutionPolicy Bypass -File "C:\Users\PC\sms-api-new\monitor\setup.ps1"
+```
+
+ينشر الـ Worker، ويحفظ المفتاح وموضوع ntfy عشوائياً كأسرار في Cloudflare، ويطبع الموضوع.
+ثبّت تطبيق **ntfy** واشترك فيه (ويُفضَّل في المتصفح على الكمبيوتر أيضاً:
+`https://ntfy.sh/<الموضوع>` — الجوال نفسه قد يكون ما سقط). خلال 5 دقائق تصلك «مراقب
+sms-api يعمل». إعادة تشغيل السكربت آمنة وتُبقي نفس الموضوع (`monitor/.ntfy-topic`، خارج git).
+
+**متى ينبّه** (`monitor/src/health.ts`):
+
+| الحالة | التنبيه |
+|---|---|
+| مشكلة استمرت فحصين متتاليين (~5 دقائق) | 🔴 مرة واحدة — لا على كل ارتعاشة شبكة |
+| `whatsapp_needs_reauth` أو `account_restricted` أو مفتاح المراقب مرفوض | 🔴 من أول فحص — لا تُصلح نفسها |
+| سبب **جديد** أثناء مشكلة معلنة | 🔴 «المشكلة تغيّرت» |
+| مشكلة ما زالت قائمة | ⏰ تذكير كل 6 ساعات |
+| التعافي من مشكلة معلنة | ✅ مرة واحدة، مع مدّتها |
+
+وتُفرّق رسالته بين: الخدمة لا تردّ إطلاقاً (جوال مطفأ/بلا إنترنت)، Cloudflare لا يجد النفق
+(530)، وأسباب `/health` نفسها. تنبيه لم يصل لأي قناة يُعاد في الفحص التالي.
+
+تيليجرام بدل ntfy أو معه: `cd monitor && npx wrangler secret put TELEGRAM_BOT_TOKEN` ثم
+`npx wrangler secret put TELEGRAM_CHAT_ID`. سجلّ الفحوص الحيّ: `npx wrangler tail sms-api-monitor`.
 
 ## 10) الاختبارات
 

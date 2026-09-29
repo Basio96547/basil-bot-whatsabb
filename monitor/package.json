@@ -1,0 +1,11 @@
+{
+  "name": "sms-api-monitor",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "4.143.0"
+  }
+}

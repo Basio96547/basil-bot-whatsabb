@@ -16,5 +16,5 @@
     "declaration": false,
     "sourceMap": false
   },
-  "include": ["src/**/*.ts", "scripts/**/*.ts"]
+  "include": ["src/**/*.ts", "scripts/**/*.ts", "monitor/src/**/*.ts"]
 }
