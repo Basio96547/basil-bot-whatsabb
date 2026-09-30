@@ -122,6 +122,8 @@ class FakeWhatsApp {
   /** Every number asked about via onWhatsApp. */
   readonly lookups: string[] = [];
   readonly notOnWhatsApp = new Set<string>();
+  /** Numbers whose existence query WhatsApp never answers. */
+  readonly unanswered = new Set<string>();
   /** Answers for the next sends, in order; afterwards every send is acknowledged. */
   readonly nextAnswers: ServerAnswer[] = [];
   accountLockQueries = 0;
@@ -159,6 +161,9 @@ class FakeSocket {
     if (this.closed) throw connectionClosed();
     const asked = numbers.map((n) => n.replace('+', '').split('@')[0]);
     this.wa.lookups.push(...asked);
+    // Baileys (rc14) does not throw when WhatsApp leaves its query unanswered:
+    // waitForMessage swallows the timeout, and onWhatsApp resolves undefined.
+    if (asked.some((digits) => this.wa.unanswered.has(digits))) return undefined;
     // Numbers that are not on WhatsApp are dropped from the list entirely.
     return asked.flatMap((digits) => (this.wa.notOnWhatsApp.has(digits) ? [] : [{ jid: `${digits}@s.whatsapp.net`, exists: true }]));
   }
@@ -670,6 +675,23 @@ test('a number that is not on WhatsApp (no SMS provider configured): nothing is 
   elapse(to, 3601);
   const { code } = await requestAndReceive(store, to);
   assert.equal(wa.lookups.filter((n) => n === to).length, 2);
+  assert.equal((await call('POST', '/otp/verify', { body: { to, code } })).status, 200);
+});
+
+// Plan 4.6: when the existence check itself fails, WhatsApp is tried anyway.
+// On this phone's stalling link the check's usual way of failing is no answer
+// at all — Baileys' 60 s query timeout comes before a dead socket is noticed.
+test('an existence check WhatsApp never answers is not taken for "not on WhatsApp": the code still goes out, and no verdict is cached against the number', async () => {
+  const to = '963900000124';
+  wa.unanswered.add(to);
+  const res = await call('POST', '/otp/request', { body: { to } });
+  const id = res.json.id as number;
+  await waitFor(`message ${id} to leave the queue`, () => messageRow(id).status !== 'pending');
+  assert.deepEqual({ status: messageRow(id).status, last_error: messageRow(id).last_error }, { status: 'sent', last_error: null });
+  assert.equal(wa.lookups.filter((n) => n === to).length, 1, 'it was asked');
+  assert.equal(count('whatsapp_status_cache', 'phone = ?', to), 0, 'an unanswered question is not an answer');
+
+  const code = codeFrom(store, 'otp', wa.delivered(jidOf(to))[0].text);
   assert.equal((await call('POST', '/otp/verify', { body: { to, code } })).status, 200);
 });
 

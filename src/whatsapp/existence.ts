@@ -33,7 +33,14 @@ export async function checkWhatsAppExists(digitsOnlyPhone: string): Promise<Exis
 
   try {
     const results = await getSocket().onWhatsApp(digitsOnlyPhone);
-    const exists = Boolean(results?.[0]?.exists);
+    // Baileys resolves undefined, not an error, when WhatsApp leaves the query
+    // unanswered (its 60 s query timeout — which on this phone's stalling link
+    // can come before a dead socket is noticed). That is no answer, not "no
+    // WhatsApp": read as one, it was cached for an hour and routed the number
+    // to SMS — with no provider, every code for it dropped as
+    // no_channel_available though the customer has WhatsApp.
+    if (!Array.isArray(results)) return 'unknown';
+    const exists = Boolean(results[0]?.exists);
     upsertCache.run(digitsOnlyPhone, exists ? 1 : 0);
     return exists ? 'yes' : 'no';
   } catch {
