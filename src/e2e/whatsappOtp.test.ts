@@ -897,8 +897,10 @@ test('logged out (the device was unlinked): /health asks for a QR and /otp/reque
 
 test('nothing in this file tried to leave the machine, and the guard really blocks', () => {
   assert.deepEqual(blockedConnections, [], 'some code path tried to reach a real server');
-  assert.throws(() => net.connect({ host: '192.0.2.1', port: 443 }), /blocked/); // TEST-NET-1
-  assert.throws(() => tls.connect({ host: 'web.whatsapp.com', port: 443 }), /blocked/);
+  // Documentation-only addresses (RFC 5737): never routed, even if the guard broke.
+  assert.throws(() => net.connect({ host: '192.0.2.1', port: 443 }), /blocked/);
+  assert.throws(() => tls.connect({ host: '198.51.100.1', port: 443 }), /blocked/);
+  assert.throws(() => http.get({ host: '203.0.113.1', port: 80 }), /blocked/);
   blockedConnections.length = 0;
   assert.equal(config.sms.enabled, false);
   assert.equal(config.sessionBackup.enabled, false);
