@@ -352,3 +352,39 @@ test('typing the RIGHT code keeps the refund of a code superseded during an outa
   const refund = (db.prepare('SELECT dropped_unsent AS d FROM messages WHERE id = ?').get(firstMessage) as { d: number }).d;
   assert.equal(refund, 1, 'لم يخمّن الزبون شيئاً — الرمز الأول الذي لم يُرسل يبقى مُسترداً');
 });
+
+// A message still waiting to go out is worth sending exactly as long as its
+// code can still be used.
+test('wrong guesses that leave the code usable do not touch its waiting message; the one that locks it drops it, unrefunded', () => {
+  clear();
+  const phone = '963900001103';
+  assert.equal(issue(phone), 'queued');
+  db.exec(`UPDATE otp_codes SET code_hash = 'unguessable'`);
+  const message = () =>
+    ({ ...(db.prepare('SELECT status, last_error, dropped_unsent FROM messages').get() as object) }) as {
+      status: string;
+      last_error: string | null;
+      dropped_unsent: number;
+    };
+  for (let i = 1; i < store.otpMaxAttempts; i++) {
+    verifyOtp(store, phone, '123456', 'login');
+    assert.equal(message().status, 'pending', `after ${i} wrong guess(es) the code still works — so must its message`);
+  }
+  verifyOtp(store, phone, '123456', 'login');
+  assert.deepEqual(message(), { status: 'failed', last_error: 'code_no_longer_valid', dropped_unsent: 0 });
+});
+
+test('an older sibling locking does not drop the waiting message of a code that is still usable', () => {
+  clear();
+  const phone = '963900001104';
+  assert.equal(issue(phone), 'queued');
+  db.exec(`UPDATE otp_codes SET code_hash = 'unguessable'`);
+  for (let i = 1; i < store.otpMaxAttempts; i++) verifyOtp(store, phone, '123456', 'login'); // first code: one attempt left
+  pastCooldown();
+  assert.equal(issue(phone), 'queued'); // second code — its message is the one waiting now
+  db.exec(`UPDATE otp_codes SET code_hash = 'unguessable'`);
+
+  verifyOtp(store, phone, '123456', 'login'); // locks the first code, spends one of the second's five
+  const waiting = db.prepare(`SELECT status FROM messages WHERE id = (SELECT MAX(id) FROM messages)`).get() as { status: string };
+  assert.equal(waiting.status, 'pending');
+});

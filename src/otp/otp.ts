@@ -110,6 +110,25 @@ const withdrawRefunds = db.prepare(`
   )
 `);
 
+// README 8 drops a message whose code expired rather than delivering it late
+// — "an expired verification code is worse than no message". A code that can
+// no longer be used for any other reason is just as dead: the number verified
+// (with it, or with a sibling — one use spends them all), or wrong guesses
+// used up its attempts. Its message, still waiting behind an outage or a
+// retry, went out anyway: a code for a verification that was already over —
+// after a password reset, a reset code the owner never asked for. It is
+// dropped like a superseded one. Nothing is refunded from the daily cap: a
+// code that was checked against a guess always counts (REFUNDABLE_IF_DROPPED
+// in queue.ts), and every code reaching this state was.
+const dropMessagesOfDeadCodes = db.prepare(`
+  UPDATE messages SET status = 'failed', last_error = 'code_no_longer_valid', updated_at = datetime('now')
+  WHERE status = 'pending' AND id IN (
+    SELECT message_id FROM otp_codes
+    WHERE project = ? AND phone = ? AND purpose = ? AND message_id IS NOT NULL
+      AND (verified_at IS NOT NULL OR attempts >= max_attempts)
+  )
+`);
+
 // A verification whose RESPONSE was lost is still a verification. The sites
 // give up after 8 s; this phone's link stalls for longer than that, so the
 // request lands, the code is spent, the answer never arrives — and the
@@ -357,6 +376,7 @@ export function verifyOtp(project: ProjectConfig, phone: string, submittedCode: 
   if (matched) {
     markAllVerified.run(project.id, phone, purpose);
     markMatched.run(matched.id);
+    dropMessagesOfDeadCodes.run(project.id, phone, purpose);
     return { ok: true };
   }
 
@@ -365,6 +385,7 @@ export function verifyOtp(project: ProjectConfig, phone: string, submittedCode: 
   // refund back then charged a customer who never guessed at all: code A
   // superseded during an outage, code B typed correctly, A counted anyway.
   withdrawRefunds.run(project.id, phone, purpose);
+  dropMessagesOfDeadCodes.run(project.id, phone, purpose); // this guess may have locked the code
 
   return { ok: false, reason: 'invalid_code', attemptsRemaining: newest.max_attempts - newest.attempts - 1 };
 }

@@ -367,6 +367,26 @@ async function requestAndReceive(
 
 const wrongCodeFor = (code: string) => (code === '000000' ? '111111' : '000000');
 
+/** WhatsApp holds every send for a minute — an account lock shorter than a code's life, so requests are still accepted. */
+function holdSends(): void {
+  wa.current.reportAccountLock({ isActive: true, enforcementType: 'RESTRICT_ALL_COMPANIONS', timeEnforcementEnds: new Date(Date.now() + 60_000) });
+}
+
+function releaseSends(): void {
+  wa.current.reportAccountLock({ isActive: false });
+}
+
+let canaries = 0;
+/**
+ * Returns once the worker has dealt with everything queued so far: the queue
+ * goes oldest first, so a message queued now being delivered means every
+ * earlier one has been sent or given up.
+ */
+async function drainQueue(): Promise<void> {
+  canaries += 1;
+  await requestAndReceive(store, `9665000009${String(canaries).padStart(2, '0')}`);
+}
+
 // ---- the tests -----------------------------------------------------------------
 
 test('boot: the service logs in over the stand-in socket and reports WhatsApp connected', async () => {
@@ -693,6 +713,50 @@ test('an existence check WhatsApp never answers is not taken for "not on WhatsAp
 
   const code = codeFrom(store, 'otp', wa.delivered(jidOf(to))[0].text);
   assert.equal((await call('POST', '/otp/verify', { body: { to, code } })).status, 200);
+});
+
+// README 8: a message whose code expired is dropped rather than delivered
+// late — "an expired verification code is worse than no message". A code
+// that can no longer be used for any other reason is just as dead.
+test('a code still waiting to go out when the number verifies with an earlier one is dropped, not delivered after the fact (login and reset)', async () => {
+  for (const [flow, to] of [['otp', '966500000125'], ['password-reset', '963900000126']] as const) {
+    const first = await requestAndReceive(store, to, flow);
+    elapse(to, store.resendCooldownMinutes * 60 + 1); // the customer asks again once the cooldown allows
+    holdSends();
+    const second = await call('POST', `/${flow}/request`, { body: { to } });
+    assert.deepEqual([second.status, second.json.status], [202, 'queued']);
+    const id = second.json.id as number;
+
+    // …and then types the first code after all.
+    assert.equal((await call('POST', `/${flow}/verify`, { body: { to, code: first.code } })).status, 200, flow);
+    releaseSends();
+    await drainQueue();
+
+    assert.equal(wa.handedOver(jidOf(to)).length, 1, `${flow}: a code for a verification that is over reached the customer`);
+    assert.deepEqual(
+      { status: messageRow(id).status, last_error: messageRow(id).last_error },
+      { status: 'failed', last_error: 'code_no_longer_valid' },
+    );
+  }
+});
+
+test('a code locked by wrong guesses while its message waits is dropped, not delivered dead; asking again brings a fresh one', async () => {
+  const to = '966500000127';
+  holdSends();
+  const res = await call('POST', '/otp/request', { body: { to } });
+  const id = res.json.id as number;
+  const wrong = wrongCodeFor(JSON.parse(messageRow(id).payload).code as string);
+  for (let i = 0; i < store.otpMaxAttempts; i++) await call('POST', '/otp/verify', { body: { to, code: wrong } });
+  releaseSends();
+  await drainQueue();
+
+  assert.equal(wa.handedOver(jidOf(to)).length, 0, 'a locked code reached the customer');
+  assert.deepEqual(
+    { status: messageRow(id).status, last_error: messageRow(id).last_error },
+    { status: 'failed', last_error: 'code_no_longer_valid' },
+  );
+  const fresh = await requestAndReceive(store, to);
+  assert.equal((await call('POST', '/otp/verify', { body: { to, code: fresh.code } })).status, 200);
 });
 
 test('password reset: delivered with the reset wording, verifies into a single-use token, and the code cannot mint another after the reset', async () => {
