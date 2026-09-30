@@ -26,6 +26,13 @@ process.env.PROJECT_API_KEY_QAREEB ??= 'test-qareeb-key';
 process.env.PROJECT_API_KEY_FIREWORKS ??= 'test-fireworks-key';
 process.env.OTP_HASH_SECRET ??= 'test-otp-hash-secret';
 process.env.SESSION_BACKUP_ENCRYPTION_KEY ??= 'test-passphrase-for-backup-roundtrip';
+// Blank, and set before config.ts runs: dotenv never overrides a variable that
+// already exists. On the phone, .env holds the real R2 credentials, and without
+// this the restore paths below reached the real session-backup bucket (and an
+// SMS provider, once one is configured) from a plain `npm test`.
+for (const name of ['SMS_PROVIDER', 'SMS_API_URL', 'SMS_API_KEY', 'R2_ACCOUNT_ID', 'R2_ACCESS_KEY_ID', 'R2_SECRET_ACCESS_KEY']) {
+  process.env[name] = '';
+}
 
 const { prepareSession, connectWhatsApp, getConnectionState, isLinkedIdentity, getSocket, sendTextAwaitingAck, WhatsAppRejectedError } =
   await import('./client.ts');
