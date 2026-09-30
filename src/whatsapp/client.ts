@@ -7,6 +7,7 @@ import makeWASocket, {
   type AuthenticationCreds,
   type BinaryNode,
   type ReachoutTimelockState,
+  type UserFacingSocketConfig,
   type WASocket,
 } from '@whiskeysockets/baileys';
 import qrcodeTerminal from 'qrcode-terminal';
@@ -196,6 +197,24 @@ async function getProtocolVersion(): Promise<ProtocolVersion> {
   return fallback;
 }
 
+type SocketOptions = Omit<UserFacingSocketConfig, 'version'>;
+
+/** Opens a socket to WhatsApp's servers — the one place this service connects to WhatsApp at all. */
+async function openWhatsAppSocket(options: SocketOptions): Promise<WASocket> {
+  return makeWASocket({ ...options, version: await getProtocolVersion() });
+}
+
+// Replaced only by the end-to-end test, with a stand-in socket that records
+// what would have been sent: everything around the socket (connection
+// handling, the queue worker, the send and its ack) then runs for real, and
+// no test can ever reach WhatsApp's servers. Production never replaces it.
+let openSocket: (options: SocketOptions) => Promise<WASocket> = openWhatsAppSocket;
+
+/** Tests only — see `openSocket`. Must be called before startWhatsApp(). */
+export function setSocketFactoryForTest(factory: (options: SocketOptions) => Promise<WASocket>): void {
+  openSocket = factory;
+}
+
 export function getSocket(): WASocket {
   if (!socket) throw new Error('WhatsApp socket not initialized yet');
   return socket;
@@ -374,12 +393,7 @@ export async function connectWhatsApp(): Promise<void> {
     }
   }
 
-  const version = await getProtocolVersion();
-
-  const previousSocket = socket;
-  const myGeneration = ++generation;
-  socket = makeWASocket({
-    version,
+  const opened = await openSocket({
     auth: authState,
     logger,
 
@@ -407,6 +421,10 @@ export async function connectWhatsApp(): Promise<void> {
     // خادم؛ مضاعفته تنصّف الإيقاظات بلا أثر على التسليم.
     keepAliveIntervalMs: config.whatsapp.keepAliveIntervalMs,
   });
+
+  const previousSocket = socket;
+  const myGeneration = ++generation;
+  socket = opened;
 
   // Reconnecting used to leave the old socket open with its keep-alive timers
   // still running — one leaked socket per drop, on a phone, forever.

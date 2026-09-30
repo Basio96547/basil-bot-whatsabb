@@ -101,7 +101,8 @@ export function validateVariants(event: string, variants: unknown): string | nul
   return null;
 }
 
-function variantsFor(event: string, overrides?: TemplateOverrides): string[] | undefined {
+/** The variants in force for `event`: the project's own if it has any, else the shared defaults above. */
+export function variantsFor(event: string, overrides?: TemplateOverrides): string[] | undefined {
   return overrides?.[event] ?? VARIANTS[event];
 }
 
