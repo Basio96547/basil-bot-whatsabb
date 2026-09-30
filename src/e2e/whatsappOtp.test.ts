@@ -747,6 +747,18 @@ test('five codes actually delivered to one number in a day is the cap: the sixth
   assert.equal((await call('POST', '/otp/verify', { body: { to, code: last } })).status, 200);
 });
 
+// Plan 4.3: codes are stored only as a hash, so that someone holding the
+// database cannot read a live code and use it. Plan 10: a code is not kept
+// once it is used or expired. The queued message is the one place the code
+// must exist in the clear — until it has been delivered.
+test('a delivered code is not left readable in the database — the sent message keeps no copy, while the customer\'s still works', async () => {
+  const to = '966500000123';
+  const { id, code } = await requestAndReceive(store, to);
+  const { payload } = messageRow(id);
+  assert.ok(!payload.includes(code), `the sent message still stores the live code: ${payload}`);
+  assert.equal((await call('POST', '/otp/verify', { body: { to, code } })).status, 200);
+});
+
 // Runs late on purpose: five consecutive failures trip the circuit breaker,
 // which then pauses WhatsApp for every later test in this file.
 test('a message that keeps failing is tried five times on the documented delays, then marked failed — never sent', async () => {
@@ -774,6 +786,13 @@ test('a message that keeps failing is tried five times on the documented delays,
   // Five failures in a row also pause the channel — visible to the monitor.
   const health = await call('GET', '/health');
   assert.ok((health.json.reasons as string[]).includes('channel_paused'), JSON.stringify(health.json.reasons));
+});
+
+test('no message that has left the queue in this whole run — sent, failed, refused, dropped — still holds a code', () => {
+  const leftovers = db
+    .prepare(`SELECT id, status, last_error FROM messages WHERE status != 'pending' AND json_extract(payload, '$.code') IS NOT NULL`)
+    .all();
+  assert.deepEqual(leftovers.map((row) => ({ ...row })), []);
 });
 
 test('logged out (the device was unlinked): /health asks for a QR and /otp/request is 503 without issuing a code', async () => {

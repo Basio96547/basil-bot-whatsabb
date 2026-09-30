@@ -218,3 +218,33 @@ addColumnIfMissing('otp_codes', 'matched_at', 'TEXT');
 // same failure that tripped the circuit breaker also killed the message.
 // NULL means "now".
 addColumnIfMissing('messages', 'next_attempt_at', 'TEXT');
+
+// A verification code exists in the clear in one place only: the payload of
+// the message that delivers it — the worker renders it into the text, after a
+// restart too. Everywhere else it is a hash, because a copy of this file must
+// not hand out live codes (plan 4.3), and no code is kept once it is used or
+// expired (plan 10). The message rows kept theirs anyway, for the 90 days they
+// are retained: readable, and still valid for the ten minutes after delivery.
+// The code now goes the moment its message stops being pending — sent, failed,
+// dropped, superseded, expired — whichever statement does it.
+//
+// json_valid first, lazily (CASE): json_extract throws on malformed JSON, and
+// one odd row must not make every status change on it — or the boot — fail.
+const HOLDS_CODE = (payload: string) => `(CASE WHEN json_valid(${payload}) THEN json_extract(${payload}, '$.code') END) IS NOT NULL`;
+db.exec(`
+  CREATE TRIGGER IF NOT EXISTS messages_forget_code_when_done
+  AFTER UPDATE OF status ON messages
+  WHEN NEW.status != 'pending' AND ${HOLDS_CODE('NEW.payload')}
+  BEGIN
+    UPDATE messages SET payload = json_remove(payload, '$.code') WHERE id = NEW.id;
+  END;
+`);
+
+/** Removes the codes finished messages still hold — what versions before the trigger above left behind. */
+export function scrubCodesFromFinishedMessages(): number {
+  const stmt = db.prepare(
+    `UPDATE messages SET payload = json_remove(payload, '$.code') WHERE status != 'pending' AND ${HOLDS_CODE('payload')}`,
+  );
+  return Number(stmt.run().changes);
+}
+scrubCodesFromFinishedMessages();

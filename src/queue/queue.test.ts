@@ -25,8 +25,18 @@ process.env.PROJECT_API_KEY_FIREWORKS ??= 'test-fireworks-key';
 process.env.OTP_HASH_SECRET ??= 'test-otp-hash-secret';
 process.env.SESSION_BACKUP_ENCRYPTION_KEY ??= 'test-passphrase-for-backup-roundtrip';
 
-const { enqueue } = await import('./queue.ts');
-const { db } = await import('../db.ts');
+const {
+  enqueue,
+  markSent,
+  markSentIfStillPending,
+  markFailedPermanently,
+  dropUnsent,
+  supersedePending,
+  expireOverdue,
+  recordFailedAttempt,
+  deferMessage,
+} = await import('./queue.ts');
+const { db, scrubCodesFromFinishedMessages } = await import('../db.ts');
 
 function clear(): void {
   db.exec('DELETE FROM messages;');
@@ -66,4 +76,87 @@ test('a message queues normally while under both caps', () => {
   const result = enqueue({ project: 'tenant-a', event: 'order_created', recipient: '963900000004', payload: {} });
   assert.equal(result.ok, true);
   assert.equal(typeof (result as { id: number }).id, 'number');
+});
+
+// ---- a verification code lives in the queue only until its message is done ----
+//
+// Plan 4.3 stores codes only as a hash so that a copy of the database cannot
+// hand out live codes; plan 10 keeps no code after it is used or expired. The
+// queued message is the one place a code has to exist in the clear — for as
+// long as it may still be sent.
+
+function queueCode(event: 'otp' | 'password_reset' = 'otp', recipient = '963900000050'): number {
+  const result = enqueue({ project: 'store', event, recipient, payload: { code: '482913' } });
+  assert.equal(result.ok, true);
+  return (result as { id: number }).id;
+}
+
+function storedPayload(id: number): Record<string, unknown> {
+  return JSON.parse((db.prepare('SELECT payload FROM messages WHERE id = ?').get(id) as { payload: string }).payload);
+}
+
+test('every way a code message leaves the queue — sent, failed, dropped, superseded, expired — takes the code with it', () => {
+  const finish: Array<[string, (id: number) => void]> = [
+    ['sent', (id) => markSent(id, 'whatsapp', 0)],
+    ['sent after a late ack', (id) => assert.equal(markSentIfStillPending(id, 'whatsapp', 0), true)],
+    ['failed for good', (id) => markFailedPermanently(id, 'whatsapp_rejected_463')],
+    ['dropped unsent', (id) => dropUnsent(id, 'no_channel_available')],
+    ['superseded', () => assert.equal(supersedePending('store', '963900000050', 'otp'), 1)],
+    ['expired', (id) => {
+      db.prepare(`UPDATE messages SET expires_at = datetime('now', '-1 minutes') WHERE id = ?`).run(id);
+      assert.equal(expireOverdue(), 1);
+    }],
+  ];
+  for (const [how, done] of finish) {
+    clear();
+    const id = queueCode();
+    done(id);
+    assert.notEqual((db.prepare('SELECT status FROM messages WHERE id = ?').get(id) as { status: string }).status, 'pending', how);
+    assert.deepEqual(storedPayload(id), {}, `${how}: the code is still stored`);
+  }
+
+  clear();
+  const reset = queueCode('password_reset');
+  markSent(reset, 'whatsapp', 0);
+  assert.deepEqual(storedPayload(reset), {}, 'password-reset codes too');
+});
+
+test('a code message that is still waiting keeps its code — a retry has to render it again', () => {
+  clear();
+  const failedOnce = queueCode('otp', '963900000051');
+  recordFailedAttempt(failedOnce, 'whatsapp', 'no_server_ack', 30_000);
+  const deferred = queueCode('otp', '963900000052');
+  deferMessage(deferred, 'channel_resolution_error', 60_000);
+  assert.deepEqual(storedPayload(failedOnce), { code: '482913' });
+  assert.deepEqual(storedPayload(deferred), { code: '482913' });
+});
+
+test('codes an older version left in finished messages are removed, and nothing else in those payloads is touched', () => {
+  clear();
+  // Rows exactly as the previous version left them: finished, code still inside.
+  const insert = db.prepare(
+    `INSERT INTO messages (project, event, recipient, payload, status) VALUES ('store', ?, '963900000053', ?, ?)`,
+  );
+  const sent = Number(insert.run('otp', '{"code":"482913"}', 'sent').lastInsertRowid);
+  const failed = Number(insert.run('password_reset', '{"code":"482913"}', 'failed').lastInsertRowid);
+  const waiting = Number(insert.run('otp', '{"code":"482913"}', 'pending').lastInsertRowid);
+  const order = Number(insert.run('order_created', '{"order":"7","amount":"5"}', 'sent').lastInsertRowid);
+
+  scrubCodesFromFinishedMessages();
+
+  assert.deepEqual(storedPayload(sent), {});
+  assert.deepEqual(storedPayload(failed), {});
+  assert.deepEqual(storedPayload(waiting), { code: '482913' }, 'still to be sent');
+  assert.deepEqual(storedPayload(order), { order: '7', amount: '5' });
+});
+
+test('a row whose payload is not JSON still changes status, and the cleanup passes over it instead of failing the boot', () => {
+  clear();
+  const id = Number(
+    db.prepare(`INSERT INTO messages (project, event, recipient, payload) VALUES ('store', 'otp', '963900000054', 'not json')`).run()
+      .lastInsertRowid,
+  );
+  dropUnsent(id, 'template_render_failed');
+  assert.equal((db.prepare('SELECT status FROM messages WHERE id = ?').get(id) as { status: string }).status, 'failed');
+  assert.equal(scrubCodesFromFinishedMessages(), 0);
 });
