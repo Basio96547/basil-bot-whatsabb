@@ -155,6 +155,8 @@ powershell -ExecutionPolicy Bypass -File "C:\Users\PC\sms api\scripts\push-to-ph
 
 الرسالة لا تُعدّ «مُرسَلة» (`sent`) إلا بعد أن يُقرّ خادم واتساب باستلامها. رفض من واتساب (مثل `whatsapp_rejected_463` حين يكون الحساب مقيّداً) يظهر في `last_error` بـ`/status`، والفشل المؤقت يُعاد بتباعد (٣٠ث، ١د، ٢د، ٤د) حتى خمس محاولات.
 
+رسالة كودٍ صار غير صالح قبل أن تخرج — تحقّق الرقم بكود آخر، أو قُفل بالتخمين — تُسقَط بـ`code_no_longer_valid` بدل أن تصل ميتة. والكود لا يبقى مقروءاً في سجل الرسالة بعد أن تخرج أو تُسقَط (بند 4.3 و10 بالخطة).
+
 ## 6) إضافة موقع جديد + قوالب خاصة به
 
 كل موقع = مدخل في `config/projects.json` + متغيّر بيئة `PROJECT_API_KEY_<ID بأحرف كبيرة>` بـ `.env`. **بدون المتغيّر الخدمة ما تقلع أصلاً** (فشل مبكر مقصود بـ `src/config.ts`).
@@ -299,3 +301,91 @@ Cloudflare، ويشغّل الساعة. خلال 5 دقائق تصلك في تي
 ```bash
 npm test
 ```
+
+## 11) اختبار كود التفعيل عبر واتساب
+
+### أ) الاختبار الآلي — من الطلب إلى محادثة الزبون
+
+`src/e2e/whatsappOtp.test.ts` يشغّل الخدمة نفسها داخل الاختبار كما يشغّلها `src/index.ts`: خادم HTTP على `127.0.0.1`، وعامل الطابور، ومعالجة اتصال واتساب وإعادة الاتصال. الشيء الوحيد المستبدَل هو مقبس Baileys: مقبس بديل يسجّل كل رسالة كانت ستخرج، ويردّ كما يردّ خادم واتساب (إقرار، إقرار بخطأ، لا إقرار، «الرقم ليس على واتساب»، انقطاع، قيد على الحساب). لا يتصل بواتساب ولا يعرض QR ولا يرسل SMS ولا يلمس R2، وأي اتصال يخرج من الجهاز يُرفض داخل الاختبار نفسه.
+
+ما يتحقق منه، لـ`/otp/*` و`/password-reset/*` معاً:
+- **المستلم**: `9665…` و`9639…` تصل إلى `<الرقم>@s.whatsapp.net`. أي صيغة أخرى (`+966…`، `05…`، `00966…`، أرقام عربية، مسافات) تُرفض بـ`400 invalid_recipient_format`، ولا يصدر كود ولا تخرج رسالة
+- **نص الرسالة**: إحدى صيغ المشروع المعرّفة (في `projects.json` أو الافتراضية)، وفيها اسم المشروع والكود نفسه من ٦ أرقام، بلا أي `{…}` متبقٍّ
+- **التحقق**: الكود الصحيح `200`، والخاطئ `invalid_code` مع المحاولات الباقية، والسقف `too_many_attempts`. الكود ينتهي بعد الدقائق المضبوطة بالضبط، ويبقى مقبولاً دقيقتين فقط بعد استعماله. طلب ثانٍ ضمن التهدئة يرجع `alreadySent` ولا تخرج رسالة ثانية. ويتحقق أيضاً من الحد اليومي، ورفض مفتاح API الناقص أو الخاطئ، وأن مفتاح مشروع لا يتحقق من كود مشروع آخر
+- **التسليم**: انقطاع ثم إعادة اتصال (الكود ينتظر ولا تُستهلك محاولاته)، إعادة المحاولة بعد ٣٠ث ثم ١د ثم ٢د ثم ٤د والفشل بعد خمس محاولات، رفض `463`، قيد الحساب (`503`)، رقم بلا واتساب (`no_channel_available`)، تسجيل الخروج
+
+التشغيل مع بقية الاختبارات: `npm test`. أو وحده (نحو ٨ ثوانٍ، خمس منها انتظار إعادة الاتصال الحقيقية):
+
+```bash
+node --import tsx --test src/e2e/whatsappOtp.test.ts
+```
+
+### ب) الفحص اليدوي الحيّ على الجوال — مرة بعد أي تغيير في الإرسال
+
+الاختبار الآلي لا يستطيع إثبات أن واتساب نفسه يسلّم الرسالة: هذا يحتاج ربطاً حقيقياً ورقماً حقيقياً، ولا يُجرى إلا منك. كل تشغيل كامل يستهلك كوداً من الخمسة اليومية لرقمك، فلا تكرره كثيراً (والإرسال الزائد إشارة حظر أيضاً).
+
+1. **المتغيرات** (داخل Termux على الجوال):
+   ```bash
+   cd ~/sms-api
+   BASE=http://127.0.0.1:3000    # من خارج الجوال: https://sms-api.talisham.com
+   API_KEY=$(grep '^PROJECT_API_KEY_STORE=' .env | tail -1 | cut -d= -f2- | tr -d '\r"')
+   MY_NUMBER=9665XXXXXXXX        # أو 9639XXXXXXXX — بصيغة دولية: أرقام فقط، بلا + وبلا صفر بداية
+   ```
+   الأصدق أن يكون `MY_NUMBER` رقماً آخر تملكه غير الرقم المربوط بالخدمة: الرسالة إلى الرقم نفسه تظهر في محادثتك مع نفسك، لا كما يراها الزبون.
+
+2. **هل الخدمة مربوطة ومتصلة؟**
+   ```bash
+   curl -sS -w '\nHTTP %{http_code}\n' "$BASE/health" -H "Authorization: Bearer $API_KEY"
+   ```
+   المتوقع: `HTTP 200` و`"status":"ok"` و`"connected":true`.
+   - `whatsapp_needs_reauth`: الجلسة تحتاج QR. شغّل الخدمة في الواجهة ليظهر، وامسحه أنت من واتساب ← الأجهزة المرتبطة ← ربط جهاز:
+     ```bash
+     pm2 stop sms-api && npm start   # امسح QR، وانتظر سطر «[whatsapp] متصل»، ثم Ctrl+C
+     pm2 start sms-api
+     ```
+   - `account_restricted`: لا تمسح أي QR — انتظر انتهاء القيد (قسم 9).
+   - `whatsapp_disconnected` وحده يُصلح نفسه خلال دقائق — أعد الفحص.
+
+3. **اطلب كوداً:**
+   ```bash
+   curl -sS -w '\nHTTP %{http_code}\n' -X POST "$BASE/otp/request" \
+     -H "Authorization: Bearer $API_KEY" -H 'Content-Type: application/json' \
+     -d "{\"to\":\"$MY_NUMBER\"}"
+   ```
+   المتوقع: `HTTP 202` و`{"id":N,"status":"queued"}`. أعد الأمر نفسه فوراً: `HTTP 202` مع `"alreadySent":true`، **ولا تصل رسالة ثانية**. ترويسة `Content-Type` ضرورية: بدونها لا يُقرأ الجسم ويرجع `400 invalid_recipient_format`.
+
+4. **تتبّع الرسالة** (ضع مكان `N` الرقم الذي رجع):
+   ```bash
+   curl -sS "$BASE/status/N" -H "Authorization: Bearer $API_KEY"
+   ```
+   المتوقع خلال ثوانٍ: `"status":"sent"` و`"channel":"whatsapp"`. إن بقيت `pending` أكثر من دقيقة فراجع `/health`. وإن صارت `failed` فالسبب في `last_error`: `whatsapp_rejected_463` معناه أن الحساب مقيّد، و`no_channel_available` معناه أن واتساب قال إن الرقم ليس عليه.
+
+5. **الرسالة على جوالك**: تصل من الرقم المربوط، بإحدى صيغ المشروع. مثلاً بالصيغ الافتراضية:
+   `رمز التحقق الخاص بك في <brandName>: 123456. صالح لمدة 10 دقائق.`
+   تأكد من ثلاثة أشياء: اسم المشروع هو `brandName` من `config/projects.json`، والكود ٦ أرقام بالضبط، ولا يوجد أي `{…}` في النص.
+
+6. **تحقّق** — أولاً بكود خاطئ عمداً (`000000`، أو أي ستة أرقام غير التي وصلتك):
+   ```bash
+   curl -sS -w '\nHTTP %{http_code}\n' -X POST "$BASE/otp/verify" \
+     -H "Authorization: Bearer $API_KEY" -H 'Content-Type: application/json' \
+     -d "{\"to\":\"$MY_NUMBER\",\"code\":\"000000\"}"
+   ```
+   المتوقع: `HTTP 400` مع `"error":"invalid_code"` و`"attemptsRemaining":4`. ثم الأمر نفسه والكود الذي وصلك مكان `000000`: `HTTP 200` و`{"ok":true}`.
+
+7. **إعادة تعيين كلمة المرور** (بحصة يومية منفصلة عن كود التفعيل):
+   ```bash
+   curl -sS -w '\nHTTP %{http_code}\n' -X POST "$BASE/password-reset/request" \
+     -H "Authorization: Bearer $API_KEY" -H 'Content-Type: application/json' \
+     -d "{\"to\":\"$MY_NUMBER\"}"
+   # تصل رسالة بصيغة إعادة التعيين. ضع الكود الذي وصلك مكان 123456:
+   curl -sS -w '\nHTTP %{http_code}\n' -X POST "$BASE/password-reset/verify" \
+     -H "Authorization: Bearer $API_KEY" -H 'Content-Type: application/json' \
+     -d "{\"to\":\"$MY_NUMBER\",\"code\":\"123456\"}"
+   # يرجع {"ok":true,"resetToken":"…"} — ضع الرمز مكان <resetToken>:
+   curl -sS -w '\nHTTP %{http_code}\n' -X POST "$BASE/password-reset/validate-token" \
+     -H "Authorization: Bearer $API_KEY" -H 'Content-Type: application/json' \
+     -d '{"token":"<resetToken>"}'
+   ```
+   المتوقع: `HTTP 200` و`{"ok":true,"phone":"…"}` برقمك في المرة الأولى، و`HTTP 400` مع `not_found_or_expired` إن أعدته.
+
+لفحص مشروع آخر (مثل `qareeb`) استعمل مفتاحه: `PROJECT_API_KEY_QAREEB` بدل `PROJECT_API_KEY_STORE`، وستصل الرسالة بصيغه الخاصة من `projects.json`.
