@@ -418,3 +418,32 @@ test('verifying with the earlier code while a newer one waits leaves a plain coo
   const again = issueAndQueue(store, phone, 'otp', store.otpExpiryMinutes);
   assert.equal(again.kind === 'rejected' && again.error, 'cooldown', JSON.stringify(again));
 });
+
+test('a correct verify refunds the waiting sibling it closes: the daily cap counts what was delivered, not a code nobody sent', () => {
+  clear();
+  const phone = '963900001106';
+  const { codeA, bId } = deliveredThenWaiting(phone);
+  assert.deepEqual(verifyOtp(store, phone, codeA, 'login'), { ok: true });
+  assert.deepEqual(messageOf(bId), { status: 'failed', attempts: 0, last_error: 'code_no_longer_valid', dropped_unsent: 1 });
+
+  // A was delivered and B never left: the rest of the day's allowance is
+  // still there, one delivered code at a time.
+  for (let delivered = 2; delivered <= store.otpMaxPerDay; delivered++) {
+    pastCooldown();
+    const next = issueAndQueue(store, phone, 'otp', store.otpExpiryMinutes);
+    assert.equal(next.kind, 'queued', `delivered code ${delivered} of ${store.otpMaxPerDay}: ${JSON.stringify(next)}`);
+    markSent((next as { id: number }).id, 'whatsapp', 0);
+  }
+  pastCooldown();
+  const capped = issueAndQueue(store, phone, 'otp', store.otpExpiryMinutes);
+  assert.equal(capped.kind === 'rejected' && capped.error, 'daily_limit');
+});
+
+test('a message already on its way when the verify closes its code is not refunded: it may have been delivered', () => {
+  clear();
+  const phone = '963900001107';
+  const { codeA, bId } = deliveredThenWaiting(phone);
+  db.prepare(`UPDATE messages SET attempts = 1, last_error = 'no_server_ack' WHERE id = ?`).run(bId); // one attempt behind it
+  assert.deepEqual(verifyOtp(store, phone, codeA, 'login'), { ok: true });
+  assert.deepEqual(messageOf(bId), { status: 'failed', attempts: 1, last_error: 'code_no_longer_valid', dropped_unsent: 0 });
+});

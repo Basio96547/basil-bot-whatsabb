@@ -117,15 +117,30 @@ const withdrawRefunds = db.prepare(`
 // used up its attempts. Its message, still waiting behind an outage or a
 // retry, went out anyway: a code for a verification that was already over —
 // after a password reset, a reset code the owner never asked for. It is
-// dropped like a superseded one. Nothing is refunded from the daily cap: a
-// code that was checked against a guess always counts (REFUNDABLE_IF_DROPPED
-// in queue.ts), and every code reaching this state was.
-const dropMessagesOfDeadCodes = db.prepare(`
-  UPDATE messages SET status = 'failed', last_error = 'code_no_longer_valid', updated_at = datetime('now')
+// dropped like a superseded one.
+//
+// What that does to the daily cap depends on why the code died:
+//
+// - Verified: refunded like any message that never left (attempts = 0; one
+//   with an attempt behind it may have been delivered, so it keeps counting).
+//   A right code closes every code for the number, so the refund cannot feed
+//   a guessing loop — and charging it counted, against a customer who typed
+//   the code they were sent, a code nobody ever sent them.
+// - Locked by wrong guesses: never refunded. Refunding it is what let
+//   guess-lock-reissue run without a cap (REFUNDABLE_IF_DROPPED in queue.ts).
+const dropMessagesOfVerifiedCodes = db.prepare(`
+  UPDATE messages SET status = 'failed', last_error = 'code_no_longer_valid', dropped_unsent = (attempts = 0),
+    updated_at = datetime('now')
   WHERE status = 'pending' AND id IN (
     SELECT message_id FROM otp_codes
-    WHERE project = ? AND phone = ? AND purpose = ? AND message_id IS NOT NULL
-      AND (verified_at IS NOT NULL OR attempts >= max_attempts)
+    WHERE project = ? AND phone = ? AND purpose = ? AND message_id IS NOT NULL AND verified_at IS NOT NULL
+  )
+`);
+const dropMessagesOfLockedCodes = db.prepare(`
+  UPDATE messages SET status = 'failed', last_error = 'code_no_longer_valid', dropped_unsent = 0, updated_at = datetime('now')
+  WHERE status = 'pending' AND id IN (
+    SELECT message_id FROM otp_codes
+    WHERE project = ? AND phone = ? AND purpose = ? AND message_id IS NOT NULL AND attempts >= max_attempts
   )
 `);
 
@@ -381,7 +396,7 @@ export function verifyOtp(project: ProjectConfig, phone: string, submittedCode: 
   if (matched) {
     markAllVerified.run(project.id, phone, purpose);
     markMatched.run(matched.id);
-    dropMessagesOfDeadCodes.run(project.id, phone, purpose);
+    dropMessagesOfVerifiedCodes.run(project.id, phone, purpose);
     return { ok: true };
   }
 
@@ -390,7 +405,7 @@ export function verifyOtp(project: ProjectConfig, phone: string, submittedCode: 
   // refund back then charged a customer who never guessed at all: code A
   // superseded during an outage, code B typed correctly, A counted anyway.
   withdrawRefunds.run(project.id, phone, purpose);
-  dropMessagesOfDeadCodes.run(project.id, phone, purpose); // this guess may have locked the code
+  dropMessagesOfLockedCodes.run(project.id, phone, purpose); // this guess may have locked the code
 
   return { ok: false, reason: 'invalid_code', attemptsRemaining: newest.max_attempts - newest.attempts - 1 };
 }
