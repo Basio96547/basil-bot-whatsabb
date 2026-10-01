@@ -172,9 +172,8 @@ export const defaultGateDeps: WhatsAppGateDeps = {
  * مقابل إرسال حقيقي — كانت تُدفع حتى للصفوف المتخطّاة، فتقضي الحلقة دقيقتين
  * في المؤقّتات لكل دفعة أثناء أي انقطاع دون أن تُرسل حرفاً واحداً.
  *
- * A verification code that leaves the queue here leaves the database files
- * too, before the next message (up to 9 s of pacing later): see db.ts's
- * truncateWal.
+ * A verification code that leaves the queue here has left the database
+ * files too by the time this returns: see db.ts's truncateWal.
  */
 export async function processMessage(msg: MessageRow, gateDeps: WhatsAppGateDeps = defaultGateDeps): Promise<boolean> {
   try {

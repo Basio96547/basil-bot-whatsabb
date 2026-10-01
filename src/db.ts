@@ -281,9 +281,10 @@ export function scrubCodesFromFinishedMessages(): number {
  * leave the WAL file as it is, to be overwritten some time later — after
  * 1000 pages of writes, which at this service's volume can take days. This
  * runs at boot, and in the worker after each message it handles and on each
- * pass of its loop (at least once a minute). With nothing in the WAL it is
- * one stat (under 10 µs measured on a PC); after a message, about 0.6 ms and
- * three fsyncs more than the two that sending and recording it already cost.
+ * pass of its loop (a pass at least once a minute while idle). With nothing
+ * in the WAL it is one stat (under 10 µs measured on a PC); after a message,
+ * about 0.6 ms and three fsyncs more than the two that queueing and recording
+ * it already cost.
  */
 export function truncateWal(): void {
   const size = statSync(`${DB_FILE}-wal`, { throwIfNoEntry: false })?.size ?? 0;

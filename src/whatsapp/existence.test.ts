@@ -139,9 +139,9 @@ test('a lookup that throws is "unknown"; real answers are cached either way', as
   assert.deepEqual({ ...(cached('963911000005') as object) }, { has_whatsapp: 0 });
 });
 
-// The reviewer's reproduction, kept: before the fix every pass below deferred
-// the message (channel_resolution_error) and asked WhatsApp again, and nothing
-// was ever sent.
+// How the bug was found, kept as a test: before the fix every pass below
+// deferred the message (channel_resolution_error) and asked WhatsApp again,
+// and nothing was ever sent.
 test('the worker sends a message whose lookup goes unanswered on its first pass — no deferral, and no second lookup', { timeout: 5_000 }, async () => {
   const phone = '963911000006';
   answers.set(phone, 'never');

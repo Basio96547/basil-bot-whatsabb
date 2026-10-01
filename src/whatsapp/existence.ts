@@ -31,9 +31,9 @@ export type ExistenceResult = 'yes' | 'no' | 'unknown';
 // defaultQueryTimeoutMs — 60 s, which client.ts does not change — and then
 // resolves undefined. Long before that the worker had stopped waiting and
 // deferred the message as channel_resolution_error; the next tick asked again,
-// and again, every ~75 s until the message expired. The 'unknown' below that
-// sends it to WhatsApp (plan 4.6) never reached anyone: a /notify message to
-// such a number cost about 1,150 unanswered queries over its day, and was
+// and again, every ~75 s until the message expired. The 'unknown' below, which
+// sends it to WhatsApp (plan 4.6), never reached the worker: a /notify message
+// to such a number cost about 1,150 unanswered queries over its day, and was
 // never tried at all.
 const SHARE_OF_CALLER_WAIT = 1 / 3;
 
