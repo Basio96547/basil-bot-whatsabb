@@ -2,6 +2,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { config } from './config.ts';
+import { VERIFICATION_EVENTS } from './templates/templates.ts';
 
 mkdirSync(config.dataDir, { recursive: true });
 export const db = new DatabaseSync(path.join(config.dataDir, 'sms-api.db'));
@@ -230,6 +231,10 @@ addColumnIfMissing('messages', 'next_attempt_at', 'TEXT');
 //
 // json_valid first, lazily (CASE): json_extract throws on malformed JSON, and
 // one odd row must not make every status change on it — or the boot — fail.
+//
+// Verification messages only. /notify stores a site's payload as it came, and
+// a "code" field there is the site's own data, kept like the rest of the log.
+const IS_VERIFICATION = (event: string) => `${event} IN (${VERIFICATION_EVENTS.map((name) => `'${name}'`).join(', ')})`;
 const HOLDS_CODE = (payload: string) => `(CASE WHEN json_valid(${payload}) THEN json_extract(${payload}, '$.code') END) IS NOT NULL`;
 // Dropped and created again at every boot, in one transaction: CREATE TRIGGER
 // IF NOT EXISTS kept whatever definition an earlier version had created under
@@ -240,7 +245,7 @@ inTransaction(() => {
   db.exec(`
     CREATE TRIGGER messages_forget_code_when_done
     AFTER UPDATE OF status ON messages
-    WHEN NEW.status != 'pending' AND ${HOLDS_CODE('NEW.payload')}
+    WHEN NEW.status != 'pending' AND ${IS_VERIFICATION('NEW.event')} AND ${HOLDS_CODE('NEW.payload')}
     BEGIN
       UPDATE messages SET payload = json_remove(payload, '$.code') WHERE id = NEW.id;
     END
@@ -251,7 +256,8 @@ inTransaction(() => {
 /** Removes the codes finished messages still hold — what versions before the trigger above left behind. */
 export function scrubCodesFromFinishedMessages(): number {
   const stmt = db.prepare(
-    `UPDATE messages SET payload = json_remove(payload, '$.code') WHERE status != 'pending' AND ${HOLDS_CODE('payload')}`,
+    `UPDATE messages SET payload = json_remove(payload, '$.code')
+     WHERE status != 'pending' AND ${IS_VERIFICATION('event')} AND ${HOLDS_CODE('payload')}`,
   );
   return Number(stmt.run().changes);
 }

@@ -43,8 +43,11 @@ export type TemplateEvent = keyof typeof VARIANTS;
 export type TemplateOverrides = Record<string, string[]>;
 
 // These events are triggered only by dedicated endpoints (/otp/request,
-// /password-reset/request) — never by the generic /notify route.
-const INTERNAL_EVENTS = new Set(['otp', 'password_reset']);
+// /password-reset/request) — never by the generic /notify route. Their
+// payload is the verification code itself (see db.ts, which forgets it once
+// the message is done).
+export const VERIFICATION_EVENTS = ['otp', 'password_reset'] as const;
+const INTERNAL_EVENTS = new Set<string>(VERIFICATION_EVENTS);
 
 export function knownEvents(): string[] {
   return Object.keys(VARIANTS).filter(e => !INTERNAL_EVENTS.has(e));

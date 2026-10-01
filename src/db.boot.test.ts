@@ -5,7 +5,7 @@
 //   removed (plan 4.3: a copy of this file must not hand out codes; plan 10:
 //   no code is kept once used or expired). Pending messages keep theirs — the
 //   worker still has to render them. A payload that is not JSON does not stop
-//   the boot.
+//   the boot. Only verification messages are touched.
 // - The trigger that forgets a code when its message finishes is replaced,
 //   not kept: CREATE TRIGGER IF NOT EXISTS never updated a definition that an
 //   earlier version had already created.
@@ -56,6 +56,7 @@ const ids: Record<string, number> = {};
   add('failedReset', 'password_reset', '{"code":"582046"}', 'failed');
   add('waiting', 'otp', '{"code":"649183"}', 'pending');
   add('notJson', 'otp', 'not json {"code":"915372"', 'failed');
+  add('order', 'order_created', '{"order":"7","amount":"5","code":"DISCOUNT10"}', 'sent');
   old.close();
 }
 
@@ -68,6 +69,7 @@ test('the boot removes the codes finished verification messages still hold, and 
   assert.equal(payloadOf(ids.failedReset), '{}');
   assert.equal(payloadOf(ids.waiting), '{"code":"649183"}', 'still to be sent — the worker renders it from here');
   assert.equal(payloadOf(ids.notJson), 'not json {"code":"915372"', 'not JSON: passed over, and the boot went on');
+  assert.deepEqual(JSON.parse(payloadOf(ids.order)), { order: '7', amount: '5', code: 'DISCOUNT10' }, 'not a verification message');
 });
 
 test('an older definition of the trigger is replaced by the current one', () => {
@@ -76,4 +78,17 @@ test('an older definition of the trigger is replaced by the current one', () => 
 
   db.prepare(`UPDATE messages SET status = 'sent' WHERE id = ?`).run(ids.waiting);
   assert.equal(payloadOf(ids.waiting), '{}', 'the trigger in place forgets a code once its message is done');
+});
+
+// /notify stores a site's payload as it came, and a "code" field there is the
+// site's own data, not a verification code of this service: it is kept like
+// the rest of the message log.
+test('a finished message that is not a verification keeps its payload, a "code" field included', () => {
+  const id = Number(
+    db
+      .prepare(`INSERT INTO messages (project, event, recipient, payload) VALUES ('store', 'delivered', '963900000701', '{"order":"8","code":"PICKUP-42"}')`)
+      .run().lastInsertRowid,
+  );
+  db.prepare(`UPDATE messages SET status = 'sent' WHERE id = ?`).run(id);
+  assert.deepEqual(JSON.parse(payloadOf(id)), { order: '8', code: 'PICKUP-42' });
 });
