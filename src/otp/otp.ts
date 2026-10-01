@@ -251,7 +251,12 @@ export function generateOtp(project: ProjectConfig, phone: string, purpose = 'lo
       // provably never coming, with no way to ask again until it passes.
       // Skipping straight to issuing a fresh code is safe: the daily cap
       // below still bounds how many of these a number can trigger.
-      const undeliverable = linkedMessageUndeliverable(latest.message_id);
+      //
+      // Only while the code is still unspent. A spent one needs no delivery
+      // — and verifying with an EARLIER code drops this one's waiting message
+      // (code_no_longer_valid, below), which read as "failed" here and let the
+      // very next request skip the cooldown the verify should have left.
+      const undeliverable = !latest.verified_at && linkedMessageUndeliverable(latest.message_id);
       // Locked by wrong guesses: verifyOtp now refuses this code for good, so
       // answering already_sent ("check WhatsApp") pointed the customer at a
       // dead code, and a plain cooldown left them stuck for the rest of the

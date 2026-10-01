@@ -773,6 +773,11 @@ test('a code still waiting to go out when the number verifies with an earlier on
       { status: messageRow(id).status, last_error: messageRow(id).last_error },
       { status: 'failed', last_error: 'code_no_longer_valid' },
     );
+
+    // The number has verified: asking again right away is a plain cooldown,
+    // as after any spent code — the dropped message does not open a way round it.
+    const again = await call('POST', `/${flow}/request`, { body: { to } });
+    assert.deepEqual([again.status, again.json.error], [429, 'cooldown'], `${flow}: ${JSON.stringify(again.json)}`);
   }
 });
 

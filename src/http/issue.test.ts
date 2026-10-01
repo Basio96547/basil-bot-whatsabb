@@ -28,6 +28,7 @@ const { db, inTransaction } = await import('../db.ts');
 const { generateOtp, verifyOtp } = await import('../otp/otp.ts');
 const { issueAndQueue } = await import('./routes.ts');
 const { getProjectById, config } = await import('../config.ts');
+const { markSent } = await import('../queue/queue.ts');
 
 const store = getProjectById('store')!;
 
@@ -387,4 +388,33 @@ test('an older sibling locking does not drop the waiting message of a code that 
   verifyOtp(store, phone, '123456', 'login'); // locks the first code, spends one of the second's five
   const waiting = db.prepare(`SELECT status FROM messages WHERE id = (SELECT MAX(id) FROM messages)`).get() as { status: string };
   assert.equal(waiting.status, 'pending');
+});
+
+// Code A delivered; past the cooldown the customer asks again, and code B is
+// queued but not out yet; then they type A after all. One use spends every
+// code (verifyOtp), so B's message is dropped as code_no_longer_valid.
+function deliveredThenWaiting(phone: string): { codeA: string; bId: number } {
+  const a = issueAndQueue(store, phone, 'otp', store.otpExpiryMinutes);
+  assert.equal(a.kind, 'queued');
+  const aId = (a as { id: number }).id;
+  const codeA = JSON.parse((db.prepare('SELECT payload FROM messages WHERE id = ?').get(aId) as { payload: string }).payload).code as string;
+  markSent(aId, 'whatsapp', 0);
+  pastCooldown();
+  const b = issueAndQueue(store, phone, 'otp', store.otpExpiryMinutes);
+  assert.equal(b.kind, 'queued');
+  return { codeA, bId: (b as { id: number }).id };
+}
+
+function messageOf(id: number) {
+  return { ...(db.prepare('SELECT status, attempts, last_error, dropped_unsent FROM messages WHERE id = ?').get(id) as object) };
+}
+
+test('verifying with the earlier code while a newer one waits leaves a plain cooldown — the newer message being dropped is no reason to skip it', () => {
+  clear();
+  const phone = '963900001105';
+  const { codeA } = deliveredThenWaiting(phone);
+  assert.deepEqual(verifyOtp(store, phone, codeA, 'login'), { ok: true });
+
+  const again = issueAndQueue(store, phone, 'otp', store.otpExpiryMinutes);
+  assert.equal(again.kind === 'rejected' && again.error, 'cooldown', JSON.stringify(again));
 });
