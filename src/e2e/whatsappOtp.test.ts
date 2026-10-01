@@ -92,6 +92,7 @@ const { startWorker, stopWorker } = await import('../queue/worker.ts');
 const { notifyWork } = await import('../queue/wakeup.ts');
 const { startWhatsApp, getConnectionState, setSocketFactoryForTest } = await import('../whatsapp/client.ts');
 const { variantsFor } = await import('../templates/templates.ts');
+const { DEFAULT_CONNECTION_CONFIG } = await import('@whiskeysockets/baileys');
 type WASocket = import('@whiskeysockets/baileys').WASocket;
 
 const store = getProjectById('store')!;
@@ -152,8 +153,12 @@ class FakeSocket {
   closed = true; // until WhatsApp reports the connection open
   ended = false;
   private readonly acks = new Map<string, (node: unknown) => void>();
+  private readonly openQueries = new Set<() => void>();
 
-  constructor(private readonly wa: FakeWhatsApp) {}
+  constructor(
+    private readonly wa: FakeWhatsApp,
+    private readonly queryTimeoutMs: number,
+  ) {}
 
   // -- the surface client.ts / existence.ts use --
 
@@ -162,10 +167,26 @@ class FakeSocket {
     const asked = numbers.map((n) => n.replace('+', '').split('@')[0]);
     this.wa.lookups.push(...asked);
     // Baileys (rc14) does not throw when WhatsApp leaves its query unanswered:
-    // waitForMessage swallows the timeout, and onWhatsApp resolves undefined.
-    if (asked.some((digits) => this.wa.unanswered.has(digits))) return undefined;
+    // it waits out its own query timeout (defaultQueryTimeoutMs, 60 s unless
+    // the socket options change it), swallows the timeout and resolves
+    // undefined. A closing socket fails the wait instead.
+    if (asked.some((digits) => this.wa.unanswered.has(digits))) return this.unansweredQuery();
     // Numbers that are not on WhatsApp are dropped from the list entirely.
     return asked.flatMap((digits) => (this.wa.notOnWhatsApp.has(digits) ? [] : [{ jid: `${digits}@s.whatsapp.net`, exists: true }]));
+  }
+
+  private unansweredQuery(): Promise<undefined> {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.openQueries.delete(fail);
+        resolve(undefined);
+      }, this.queryTimeoutMs);
+      const fail = () => {
+        clearTimeout(timer);
+        reject(connectionClosed());
+      };
+      this.openQueries.add(fail);
+    });
   }
 
   waitForMessage<T>(messageId: string): Promise<T | undefined> {
@@ -192,7 +213,13 @@ class FakeSocket {
 
   end(): void {
     this.ended = true;
+    this.close();
+  }
+
+  private close(): void {
     this.closed = true;
+    for (const fail of this.openQueries) fail();
+    this.openQueries.clear();
   }
 
   // -- driving it, the way Baileys reports connection changes --
@@ -203,7 +230,7 @@ class FakeSocket {
   }
 
   drop(statusCode: number): void {
-    this.closed = true;
+    this.close();
     this.ev.emit('connection.update', {
       connection: 'close',
       lastDisconnect: { error: Object.assign(new Error('closed'), { output: { statusCode } }), date: new Date() },
@@ -218,7 +245,7 @@ class FakeSocket {
 const wa = new FakeWhatsApp();
 setSocketFactoryForTest(async (options) => {
   wa.socketOptions.push(options);
-  const socket = new FakeSocket(wa);
+  const socket = new FakeSocket(wa, options.defaultQueryTimeoutMs ?? DEFAULT_CONNECTION_CONFIG.defaultQueryTimeoutMs!);
   wa.sockets.push(socket);
   return socket as unknown as WASocket;
 });
@@ -240,6 +267,7 @@ startWhatsApp();
 test.after(async () => {
   await stopWorker();
   await new Promise<void>((resolve) => server.close(() => resolve()));
+  for (const socket of wa.sockets) socket.end(); // a query still waiting on Baileys' minute fails, as on a real close
 });
 
 // ---- helpers -----------------------------------------------------------------
@@ -700,15 +728,23 @@ test('a number that is not on WhatsApp (no SMS provider configured): nothing is 
 
 // Plan 4.6: when the existence check itself fails, WhatsApp is tried anyway.
 // On this phone's stalling link the check's usual way of failing is no answer
-// at all — Baileys' 60 s query timeout comes before a dead socket is noticed.
-test('an existence check WhatsApp never answers is not taken for "not on WhatsApp": the code still goes out, and no verdict is cached against the number', async () => {
+// at all — and Baileys only gives up on that after its 60 s query timeout,
+// long after the worker stops waiting for the lookup (15 s). With production
+// timing on both sides: the stand-in never answers, as WhatsApp did not.
+test('an existence check WhatsApp never answers is not taken for "not on WhatsApp", nor left to stall the message: the code goes out on the first pass, and no verdict is cached', async () => {
   const to = '963900000124';
   wa.unanswered.add(to);
   const res = await call('POST', '/otp/request', { body: { to } });
   const id = res.json.id as number;
-  await waitFor(`message ${id} to leave the queue`, () => messageRow(id).status !== 'pending');
-  assert.deepEqual({ status: messageRow(id).status, last_error: messageRow(id).last_error }, { status: 'sent', last_error: null });
-  assert.equal(wa.lookups.filter((n) => n === to).length, 1, 'it was asked');
+  // Well under the 15 s + 60 s a deferred lookup would take to come round again.
+  await waitFor(`message ${id} to leave the queue`, () => messageRow(id).status !== 'pending', 14_000);
+  const row = messageRow(id);
+  assert.deepEqual(
+    { status: row.status, attempts: row.attempts, last_error: row.last_error, next_attempt_at: row.next_attempt_at },
+    { status: 'sent', attempts: 0, last_error: null, next_attempt_at: null },
+    'never put back as channel_resolution_error',
+  );
+  assert.equal(wa.lookups.filter((n) => n === to).length, 1, 'asked once');
   assert.equal(count('whatsapp_status_cache', 'phone = ?', to), 0, 'an unanswered question is not an answer');
 
   const code = codeFrom(store, 'otp', wa.delivered(jidOf(to))[0].text);

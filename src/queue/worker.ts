@@ -34,8 +34,11 @@ const SEND_TIMEOUT_MS = 15_000; // plan 9, point 5
 // The whole ramp (7.5 min) stays under /health's queue_stalled threshold
 // (10 min): one message working through its retries is not a stalled queue.
 const RETRY_DELAYS_MS = [30_000, 60_000, 2 * 60_000, 4 * 60_000];
-// A WhatsApp lookup that timed out says nothing about the message — it is
-// put back without spending an attempt (see deferMessage).
+// A channel lookup that could not finish (its cache read failed, or it overran
+// the wait anyway) says nothing about the message — it is put back without
+// spending an attempt (see deferMessage). A WhatsApp query that fails or goes
+// unanswered does not end up here: existence.ts answers 'unknown' inside the
+// worker's wait, and the message is tried on WhatsApp (plan 4.6).
 const LOOKUP_RETRY_DELAY_MS = 60_000;
 
 // Sends that outlived SEND_TIMEOUT_MS and have not settled yet, with when
@@ -111,7 +114,7 @@ function randomDelay(): number {
 // never settles — it doesn't cancel the in-flight WhatsApp/SMS call itself,
 // just stops one stuck send from freezing every message behind it. Exported
 // for testing: resolveChannel()'s own call site below needs the exact same
-// guarantee (Baileys' onWhatsApp() has no timeout of its own), and a real
+// guarantee (Baileys' onWhatsApp() waits up to a minute), and a real
 // SEND_TIMEOUT_MS-length test here would be far too slow for this suite.
 export function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -145,7 +148,8 @@ export interface WhatsAppGateDeps {
   pairedAtMs: () => number | null;
   activeEnforcement: () => Enforcement | null;
   checkSendRate: (pairedAtMs: number | null) => { allowed: boolean };
-  resolveChannel: (phone: string, forced?: Channel) => Promise<Channel>;
+  /** `waitMs`: how long processMessage waits for the answer — the lookup must answer inside it. */
+  resolveChannel: (phone: string, forced: Channel | undefined, waitMs: number) => Promise<Channel>;
   send: (channel: Channel, phone: string, text: string) => Promise<void>;
   /** SEND_TIMEOUT_MS; shorter only in tests, which cannot wait 15 s per case. */
   sendTimeoutMs?: number;
@@ -215,13 +219,14 @@ export async function processMessage(msg: MessageRow, gateDeps: WhatsAppGateDeps
     }
   } else {
     try {
-      // resolveChannel() routes to Baileys' onWhatsApp(), whose own query has
-      // no timeout of its own and can hang for a long time on a bad
-      // connection — unlike every other outbound call on this path
-      // (sendViaChannel below), this await had nothing bounding it, so one
-      // slow/hung lookup could block this whole batch of up to
-      // sendBatchSize messages for minutes.
-      channel = await withTimeout(gateDeps.resolveChannel(msg.recipient, forcedChannel), gateDeps.sendTimeoutMs ?? SEND_TIMEOUT_MS);
+      // resolveChannel() routes to Baileys' onWhatsApp(), whose query waits
+      // up to a minute on a bad connection — unbounded here, one slow lookup
+      // could block this whole batch of up to sendBatchSize messages for
+      // minutes. The lookup is also handed this same wait: it answers
+      // 'unknown' (try WhatsApp) well inside it, so a number WhatsApp does not
+      // answer for is sent to, not deferred below again and again.
+      const lookupWaitMs = gateDeps.sendTimeoutMs ?? SEND_TIMEOUT_MS;
+      channel = await withTimeout(gateDeps.resolveChannel(msg.recipient, forcedChannel, lookupWaitMs), lookupWaitMs);
     } catch {
       deferMessage(msg.id, 'channel_resolution_error', LOOKUP_RETRY_DELAY_MS);
       return false;
