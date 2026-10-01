@@ -317,8 +317,10 @@ npm test
 التشغيل مع بقية الاختبارات: `npm test`. أو وحده (نحو ١٣ ثانية، عشر منها انتظار حقيقي بمُهل الإنتاج: إعادة الاتصال ٥ ثوانٍ، ومهلة فحص الوجود ٥ ثوانٍ):
 
 ```bash
-node --import tsx --test src/e2e/whatsappOtp.test.ts
+node --import tsx --import ./scripts/test-env.mjs --test src/e2e/whatsappOtp.test.ts
 ```
+
+`--import ./scripts/test-env.mjs` كما في `npm test` تماماً، ولا يُحذف: بدونه يقرأ الاختبار ملف `.env` الحقيقي (على الجوال فيه سقوف الإرسال وبيانات R2) ويعمل بقيمه بدل قيم الاختبار — بملف `.env` فيه `SEND_MAX_PER_HOUR=1` فشل 18 اختباراً من 25.
 
 ### ب) الفحص اليدوي الحيّ على الجوال — مرة بعد أي تغيير في الإرسال
 

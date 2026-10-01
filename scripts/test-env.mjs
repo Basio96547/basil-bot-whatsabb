@@ -1,6 +1,7 @@
 // Loaded by `npm test` (node --import) before every test file; node --test runs
 // each file in a child process with the same --import flags, so this applies to
-// all of them.
+// all of them. A test file run on its own needs the same flag — README 11(a)
+// gives the command.
 //
 // Tests must never read the real .env. On the phone it holds the live R2
 // credentials of the session-backup bucket and, once one is chosen, the SMS
