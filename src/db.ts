@@ -231,14 +231,22 @@ addColumnIfMissing('messages', 'next_attempt_at', 'TEXT');
 // json_valid first, lazily (CASE): json_extract throws on malformed JSON, and
 // one odd row must not make every status change on it — or the boot — fail.
 const HOLDS_CODE = (payload: string) => `(CASE WHEN json_valid(${payload}) THEN json_extract(${payload}, '$.code') END) IS NOT NULL`;
-db.exec(`
-  CREATE TRIGGER IF NOT EXISTS messages_forget_code_when_done
-  AFTER UPDATE OF status ON messages
-  WHEN NEW.status != 'pending' AND ${HOLDS_CODE('NEW.payload')}
-  BEGIN
-    UPDATE messages SET payload = json_remove(payload, '$.code') WHERE id = NEW.id;
-  END;
-`);
+// Dropped and created again at every boot, in one transaction: CREATE TRIGGER
+// IF NOT EXISTS kept whatever definition an earlier version had created under
+// this name, so a change to it here would never have reached a phone that ran
+// the earlier one.
+inTransaction(() => {
+  db.exec('DROP TRIGGER IF EXISTS messages_forget_code_when_done');
+  db.exec(`
+    CREATE TRIGGER messages_forget_code_when_done
+    AFTER UPDATE OF status ON messages
+    WHEN NEW.status != 'pending' AND ${HOLDS_CODE('NEW.payload')}
+    BEGIN
+      UPDATE messages SET payload = json_remove(payload, '$.code') WHERE id = NEW.id;
+    END
+  `);
+  return true;
+});
 
 /** Removes the codes finished messages still hold — what versions before the trigger above left behind. */
 export function scrubCodesFromFinishedMessages(): number {
