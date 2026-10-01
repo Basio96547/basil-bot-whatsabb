@@ -9,6 +9,7 @@
 // - The trigger that forgets a code when its message finishes is replaced,
 //   not kept: CREATE TRIGGER IF NOT EXISTS never updated a definition that an
 //   earlier version had already created.
+// - The removed codes do not stay behind in the database files themselves.
 //
 // The old database is written with node:sqlite directly, before db.ts is
 // imported: db.ts does all of this at import time, once per process.
@@ -16,7 +17,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
-import { mkdtempSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -63,6 +64,8 @@ const ids: Record<string, number> = {};
 const { db } = await import('./db.ts');
 
 const payloadOf = (id: number) => (db.prepare('SELECT payload FROM messages WHERE id = ?').get(id) as { payload: string }).payload;
+const onDisk = (fragment: string) =>
+  [DB_FILE, `${DB_FILE}-wal`].filter((file) => existsSync(file) && readFileSync(file).includes(Buffer.from(fragment)));
 
 test('the boot removes the codes finished verification messages still hold, and leaves everything else as it was', () => {
   assert.equal(payloadOf(ids.sentLogin), '{}');
@@ -70,6 +73,15 @@ test('the boot removes the codes finished verification messages still hold, and 
   assert.equal(payloadOf(ids.waiting), '{"code":"649183"}', 'still to be sent — the worker renders it from here');
   assert.equal(payloadOf(ids.notJson), 'not json {"code":"915372"', 'not JSON: passed over, and the boot went on');
   assert.deepEqual(JSON.parse(payloadOf(ids.order)), { order: '7', amount: '5', code: 'DISCOUNT10' }, 'not a verification message');
+});
+
+// A row that forgets its code is rewritten, and the bytes it held stayed: in
+// the page's free space in sms-api.db, and in the WAL frames written before.
+test('the removed codes are gone from the database files too, not only from the rows', () => {
+  for (const code of ['731904', '582046']) {
+    assert.deepEqual(onDisk(`"code":"${code}"`), [], `code ${code} is still readable on disk`);
+  }
+  assert.notDeepEqual(onDisk('"code":"649183"'), [], 'premise: the search does find a code that is stored');
 });
 
 test('an older definition of the trigger is replaced by the current one', () => {

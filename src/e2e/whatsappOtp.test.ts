@@ -22,7 +22,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
 import net, { type AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -317,6 +317,14 @@ function messageRow(id: number) {
     next_attempt_at: string | null;
     dropped_unsent: number;
   };
+}
+
+const DB_FILE = path.join(process.env.DATA_DIR, 'sms-api.db');
+
+/** Whether `code` can still be read, as stored in a message, anywhere in the database files. */
+function codeOnDisk(code: string): boolean {
+  const stored = Buffer.from(`"code":"${code}"`);
+  return [DB_FILE, `${DB_FILE}-wal`].some((file) => existsSync(file) && readFileSync(file).includes(stored));
 }
 
 function count(table: string, where: string, ...params: Array<string | number>): number {
@@ -762,9 +770,15 @@ test('a code still waiting to go out when the number verifies with an earlier on
     const second = await call('POST', `/${flow}/request`, { body: { to } });
     assert.deepEqual([second.status, second.json.status], [202, 'queued']);
     const id = second.json.id as number;
+    const secondCode = JSON.parse(messageRow(id).payload).code as string;
+    assert.ok(codeOnDisk(secondCode), 'premise: a code waiting to go out is stored');
 
     // …and then types the first code after all.
     assert.equal((await call('POST', `/${flow}/verify`, { body: { to, code: first.code } })).status, 200, flow);
+    // Nothing is sent meanwhile (WhatsApp is holding sends): the worker's own
+    // pass takes the dropped code out of the database files.
+    notifyWork();
+    await waitFor(`${flow}: the dropped code to leave the database files`, () => !codeOnDisk(secondCode));
     releaseSends();
     await drainQueue();
 
@@ -878,11 +892,12 @@ test('five codes actually delivered to one number in a day is the cap: the sixth
 // database cannot read a live code and use it. Plan 10: a code is not kept
 // once it is used or expired. The queued message is the one place the code
 // must exist in the clear — until it has been delivered.
-test('a delivered code is not left readable in the database — the sent message keeps no copy, while the customer\'s still works', async () => {
+test('a delivered code is not left readable in the database — the sent message keeps no copy, nor do the database files, while the customer\'s still works', async () => {
   const to = '966500000123';
   const { id, code } = await requestAndReceive(store, to);
   const { payload } = messageRow(id);
   assert.ok(!payload.includes(code), `the sent message still stores the live code: ${payload}`);
+  await waitFor('the code to leave the database files', () => !codeOnDisk(code));
   assert.equal((await call('POST', '/otp/verify', { body: { to, code } })).status, 200);
 });
 

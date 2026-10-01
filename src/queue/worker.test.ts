@@ -19,7 +19,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -397,4 +397,21 @@ test('a late ack does not overwrite a failure that is not a drop — only supers
   land();
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(rowOf(id).status, 'failed');
+});
+
+// db.ts's truncateWal: a code that leaves the queue must not stay readable in
+// the WAL frames written while it waited.
+test('a verification code the worker is done with is gone from the database files when processMessage returns', async () => {
+  clear();
+  const queued = enqueue({ project: 'store', event: 'otp', recipient: '963900000412', payload: { code: '734215' } });
+  const id = (queued as { id: number }).id;
+  const stored = Buffer.from('"code":"734215"');
+  const dbFile = path.join(process.env.DATA_DIR!, 'sms-api.db');
+  const onDisk = () => [dbFile, `${dbFile}-wal`].some((file) => existsSync(file) && readFileSync(file).includes(stored));
+  assert.equal(onDisk(), true, 'premise: a waiting code is stored');
+
+  const { deps } = recorder();
+  await processMessage(getPendingBatch(10).find((m) => m.id === id)!, deps);
+  assert.equal(rowOf(id).status, 'sent');
+  assert.equal(onDisk(), false);
 });

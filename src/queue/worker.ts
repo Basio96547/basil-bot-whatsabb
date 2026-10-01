@@ -19,6 +19,7 @@ import { isPaused, recordSuccess, recordFailure } from './circuitBreaker.ts';
 import { sleepUnlessWoken, notifyWork, workSignals } from './wakeup.ts';
 import { checkSendRate } from './sendRate.ts';
 import { activeEnforcement, type Enforcement } from '../whatsapp/enforcement.ts';
+import { truncateWal } from '../db.ts';
 
 const MAX_SEND_ATTEMPTS = 5;
 const SEND_TIMEOUT_MS = 15_000; // plan 9, point 5
@@ -170,8 +171,24 @@ export const defaultGateDeps: WhatsAppGateDeps = {
  * مقطوع). الفرق ليس تجميلياً: مهلة المباعدة البشرية بين الرسائل تُدفع فقط
  * مقابل إرسال حقيقي — كانت تُدفع حتى للصفوف المتخطّاة، فتقضي الحلقة دقيقتين
  * في المؤقّتات لكل دفعة أثناء أي انقطاع دون أن تُرسل حرفاً واحداً.
+ *
+ * A verification code that leaves the queue here leaves the database files
+ * too, before the next message (up to 9 s of pacing later): see db.ts's
+ * truncateWal.
  */
 export async function processMessage(msg: MessageRow, gateDeps: WhatsAppGateDeps = defaultGateDeps): Promise<boolean> {
+  try {
+    return await handleMessage(msg, gateDeps);
+  } finally {
+    try {
+      truncateWal();
+    } catch (err) {
+      console.error('[worker] تعذّر تفريغ سجل WAL — يُعاد في الدورة التالية', err);
+    }
+  }
+}
+
+async function handleMessage(msg: MessageRow, gateDeps: WhatsAppGateDeps): Promise<boolean> {
   // A send for this row is still in flight, or went out and is waiting to be
   // recorded — either way, sending it now would be a second copy.
   const inFlightSince = unsettled.get(msg.id);
@@ -432,6 +449,9 @@ async function loop(): Promise<void> {
       // Before anything that can skip the tick: rows nobody will fetch
       // (pinned to a blocked channel) must still expire — see expireOverdue.
       expireOverdue(rowsInFlight());
+      // Codes that left the queue since the last pass without the worker
+      // (dropped by a verify, a late ack) leave the WAL here — see db.ts.
+      truncateWal();
     } catch (err) {
       console.error('[worker] تعذّر تنظيف الطابور في هذه الدورة — الإرسال مستمر', err);
     }

@@ -9,7 +9,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -36,7 +36,7 @@ const {
   recordFailedAttempt,
   deferMessage,
 } = await import('./queue.ts');
-const { db, scrubCodesFromFinishedMessages } = await import('../db.ts');
+const { db, scrubCodesFromFinishedMessages, truncateWal } = await import('../db.ts');
 
 function clear(): void {
   db.exec('DELETE FROM messages;');
@@ -119,6 +119,34 @@ test('every way a code message leaves the queue — sent, failed, dropped, super
   const reset = queueCode('password_reset');
   markSent(reset, 'whatsapp', 0);
   assert.deepEqual(storedPayload(reset), {}, 'password-reset codes too');
+});
+
+// The row forgetting its code is not enough: the file must not keep a copy.
+// A row that changes size is rewritten elsewhere in its page, and the slot it
+// left keeps the old bytes — code included — unless something reuses it, which
+// a newer row below it in the page prevents. db.ts's secure_delete zeroes the
+// slot; truncateWal empties the WAL that held the row while it waited.
+test('a finished code leaves no copy in the database files, also when a newer message sits after it in the page', () => {
+  const dbFile = path.join(process.env.DATA_DIR!, 'sms-api.db');
+  const onDisk = (code: string) =>
+    [dbFile, `${dbFile}-wal`].some((file) => existsSync(file) && readFileSync(file).includes(Buffer.from(`"code":"${code}"`)));
+  const finish: Array<[string, string, (id: number) => void]> = [
+    ['sent', '615203', (id) => markSent(id, 'whatsapp', 0)],
+    ['failed for good', '615204', (id) => markFailedPermanently(id, 'whatsapp_rejected_463')],
+    ['dropped unsent', '615205', (id) => dropUnsent(id, 'template_render_failed: no variant fits the payload')],
+  ];
+  for (const [how, code, done] of finish) {
+    clear();
+    const queued = enqueue({ project: 'store', event: 'otp', recipient: '963900000056', payload: { code } });
+    assert.equal(queued.ok, true);
+    enqueue({ project: 'store', event: 'order_created', recipient: '963900000057', payload: { order: '1', amount: '2' } });
+    truncateWal(); // as after any checkpoint: the waiting row is in the database file itself
+    assert.equal(onDisk(code), true, `${how}: premise — a waiting code is stored`);
+
+    done((queued as { id: number }).id);
+    truncateWal();
+    assert.equal(onDisk(code), false, `${how}: the code is still readable in the database files`);
+  }
 });
 
 test('a code message that is still waiting keeps its code — a retry has to render it again', () => {

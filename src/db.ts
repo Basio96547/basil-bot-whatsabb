@@ -1,15 +1,22 @@
 import { DatabaseSync } from 'node:sqlite';
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { config } from './config.ts';
 import { VERIFICATION_EVENTS } from './templates/templates.ts';
 
 mkdirSync(config.dataDir, { recursive: true });
-export const db = new DatabaseSync(path.join(config.dataDir, 'sms-api.db'));
+const DB_FILE = path.join(config.dataDir, 'sms-api.db');
+export const db = new DatabaseSync(DB_FILE);
 
 // WAL: readers (status endpoint, health check) don't block the writer (worker loop).
 db.exec('PRAGMA journal_mode = WAL');
 db.exec('PRAGMA foreign_keys = ON');
+// A row rewritten or deleted leaves its old bytes in the page's free space,
+// readable in the file — including a verification code just removed from its
+// message (see the trigger below). A finished code message with a newer row
+// after it in the page kept its code that way, whichever way it finished.
+// FAST zeroes those bytes in the page being written anyway: no extra I/O.
+db.exec('PRAGMA secure_delete = FAST');
 
 /**
  * Runs `fn` inside a single SQLite transaction, rolling back if it throws or
@@ -226,8 +233,11 @@ addColumnIfMissing('messages', 'next_attempt_at', 'TEXT');
 // not hand out live codes (plan 4.3), and no code is kept once it is used or
 // expired (plan 10). The message rows kept theirs anyway, for the 90 days they
 // are retained: readable, and still valid for the ten minutes after delivery.
-// The code now goes the moment its message stops being pending — sent, failed,
-// dropped, superseded, expired — whichever statement does it.
+// The code now goes from the row the moment its message stops being pending —
+// sent, failed, dropped, superseded, expired — whichever statement does it.
+// From the files soon after: secure_delete (above) zeroes the old bytes in the
+// page, and truncateWal (below) folds the WAL frames written while the code
+// was still pending into the database and empties the WAL.
 //
 // json_valid first, lazily (CASE): json_extract throws on malformed JSON, and
 // one odd row must not make every status change on it — or the boot — fail.
@@ -261,4 +271,24 @@ export function scrubCodesFromFinishedMessages(): number {
   );
   return Number(stmt.run().changes);
 }
+
+/**
+ * Copies whatever the WAL holds into the database file and empties the WAL,
+ * when there is anything in it.
+ *
+ * A code removed from its message is still in the WAL frames written while it
+ * was pending. SQLite's own checkpoints copy frames into the database but
+ * leave the WAL file as it is, to be overwritten some time later — after
+ * 1000 pages of writes, which at this service's volume can take days. This
+ * runs at boot, and in the worker after each message it handles and on each
+ * pass of its loop (at least once a minute). With nothing in the WAL it is
+ * one stat (under 10 µs measured on a PC); after a message, about 0.6 ms and
+ * three fsyncs more than the two that sending and recording it already cost.
+ */
+export function truncateWal(): void {
+  const size = statSync(`${DB_FILE}-wal`, { throwIfNoEntry: false })?.size ?? 0;
+  if (size > 0) db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+}
+
 scrubCodesFromFinishedMessages();
+truncateWal();
