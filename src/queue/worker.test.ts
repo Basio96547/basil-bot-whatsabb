@@ -33,7 +33,7 @@ process.env.PROJECT_API_KEY_FIREWORKS ??= 'test-fireworks-key';
 process.env.OTP_HASH_SECRET ??= 'test-otp-hash-secret';
 process.env.SESSION_BACKUP_ENCRYPTION_KEY ??= 'test-passphrase-for-backup-roundtrip';
 
-const { enqueue, getPendingBatch, supersedePending, markSentIfStillPending, markSent, markFailedPermanently, expireOverdue } = await import('./queue.ts');
+const { enqueue, getPendingBatch, supersedePending, markSentLate, markSent, markFailedPermanently, expireOverdue } = await import('./queue.ts');
 const { processMessage, defaultGateDeps, withTimeout, flushUnrecorded } = await import('./worker.ts');
 const { WhatsAppRejectedError } = await import('../whatsapp/client.ts');
 const { db } = await import('../db.ts');
@@ -209,14 +209,14 @@ test('a send that completes after its timeout is recorded as sent — once — i
   clear();
   const queued = enqueue({ project: 'store', event: 'delivered', recipient: '963900000300', payload: { order: '1' } });
   const id = (queued as { id: number }).id;
-  assert.equal(markSentIfStillPending(id, 'whatsapp', 0), true);
+  assert.equal(markSentLate(id, 'whatsapp', 0), true);
   assert.equal(rowOf(id).status, 'sent');
-  assert.equal(markSentIfStillPending(id, 'whatsapp', 0), false, 'already recorded — a no-op');
+  assert.equal(markSentLate(id, 'whatsapp', 0), false, 'already recorded — a no-op');
 
   const other = enqueue({ project: 'store', event: 'delivered', recipient: '963900000301', payload: { order: '1' } });
   const otherId = (other as { id: number }).id;
   markSent(otherId, 'whatsapp', 0); // a retry got there first
-  assert.equal(markSentIfStillPending(otherId, 'whatsapp', 1), false);
+  assert.equal(markSentLate(otherId, 'whatsapp', 1), false);
 });
 
 // resolveChannel() routes to Baileys' onWhatsApp(), which has no timeout of
@@ -374,4 +374,27 @@ test('rows nobody fetches (pinned to a blocked channel) still expire, but a row 
   assert.equal(rowOf(pinnedId).status, 'failed');
   assert.equal(rowOf(pinnedId).last_error, 'expired_before_send');
   assert.equal(rowOf(inFlightId).status, 'pending', 'its outcome is not known yet');
+});
+
+test('a send superseded while in flight and acknowledged after the timeout is recorded as the delivery it was', async () => {
+  const { id, msg } = queueOne('963900000410');
+  let land!: () => void;
+  const { deps } = recorder(() => new Promise<void>((resolve) => (land = resolve)));
+  await processMessage(msg, { ...deps, sendTimeoutMs: 20 });
+  supersedePending('store', '963900000410', 'delivered'); // a newer message for the number, while this one is still out
+  assert.equal(rowOf(id).last_error, 'superseded');
+  land();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual({ ...rowOf(id) }, { status: 'sent', attempts: 1, last_error: null });
+});
+
+test('a late ack does not overwrite a failure that is not a drop — only superseded and code_no_longer_valid rows can still have gone out', async () => {
+  const { id, msg } = queueOne('963900000411');
+  let land!: () => void;
+  const { deps } = recorder(() => new Promise<void>((resolve) => (land = resolve)));
+  await processMessage(msg, { ...deps, sendTimeoutMs: 20 });
+  db.prepare(`UPDATE messages SET status = 'failed', last_error = 'whatsapp_rejected_463' WHERE id = ?`).run(id);
+  land();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(rowOf(id).status, 'failed');
 });

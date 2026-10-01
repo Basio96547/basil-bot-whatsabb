@@ -2,7 +2,7 @@ import { config, getProjectById } from '../config.ts';
 import {
   getPendingBatch,
   markSent,
-  markSentIfStillPending,
+  markSentLate,
   markFailedPermanently,
   dropUnsent,
   isStillPending,
@@ -58,9 +58,9 @@ const UNSETTLED_GIVE_UP_MS = 5 * 60_000;
 // written as soon as the database accepts it; never re-sent meanwhile.
 const unrecorded = new Map<number, { channel: Channel; variantIndex: number }>();
 
-function recordSentOrRemember(id: number, channel: Channel, variantIndex: number, onlyIfPending: boolean): boolean {
+function recordSentOrRemember(id: number, channel: Channel, variantIndex: number, late: boolean): boolean {
   try {
-    const recorded = onlyIfPending ? markSentIfStillPending(id, channel, variantIndex) : (markSent(id, channel, variantIndex), true);
+    const recorded = late ? markSentLate(id, channel, variantIndex) : (markSent(id, channel, variantIndex), true);
     unrecorded.delete(id);
     return recorded;
   } catch (err) {
@@ -74,7 +74,7 @@ function recordSentOrRemember(id: number, channel: Channel, variantIndex: number
 export function flushUnrecorded(): void {
   for (const [id, sent] of unrecorded) {
     try {
-      markSentIfStillPending(id, sent.channel, sent.variantIndex);
+      markSentLate(id, sent.channel, sent.variantIndex);
       unrecorded.delete(id);
     } catch {
       return; // the database still refuses writes — try again next tick

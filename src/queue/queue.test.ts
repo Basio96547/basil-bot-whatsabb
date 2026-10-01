@@ -28,7 +28,7 @@ process.env.SESSION_BACKUP_ENCRYPTION_KEY ??= 'test-passphrase-for-backup-roundt
 const {
   enqueue,
   markSent,
-  markSentIfStillPending,
+  markSentLate,
   markFailedPermanently,
   dropUnsent,
   supersedePending,
@@ -98,7 +98,7 @@ function storedPayload(id: number): Record<string, unknown> {
 test('every way a code message leaves the queue — sent, failed, dropped, superseded, expired — takes the code with it', () => {
   const finish: Array<[string, (id: number) => void]> = [
     ['sent', (id) => markSent(id, 'whatsapp', 0)],
-    ['sent after a late ack', (id) => assert.equal(markSentIfStillPending(id, 'whatsapp', 0), true)],
+    ['sent after a late ack', (id) => assert.equal(markSentLate(id, 'whatsapp', 0), true)],
     ['failed for good', (id) => markFailedPermanently(id, 'whatsapp_rejected_463')],
     ['dropped unsent', (id) => dropUnsent(id, 'no_channel_available')],
     ['superseded', () => assert.equal(supersedePending('store', '963900000050', 'otp'), 1)],
@@ -159,4 +159,13 @@ test('a row whose payload is not JSON still changes status, and the cleanup pass
   dropUnsent(id, 'template_render_failed');
   assert.equal((db.prepare('SELECT status FROM messages WHERE id = ?').get(id) as { status: string }).status, 'failed');
   assert.equal(scrubCodesFromFinishedMessages(), 0);
+});
+
+test('a message sent after failed attempts keeps no error from them', () => {
+  clear();
+  const id = queueCode('otp', '963900000055');
+  recordFailedAttempt(id, 'whatsapp', 'no_server_ack', 0);
+  markSent(id, 'whatsapp', 0);
+  const row = db.prepare('SELECT status, attempts, last_error FROM messages WHERE id = ?').get(id);
+  assert.deepEqual({ ...(row as object) }, { status: 'sent', attempts: 1, last_error: null });
 });

@@ -107,14 +107,24 @@ export function getPendingBatch(limit: number, blockedForcedChannels: Channel[] 
 }
 
 // `dropped_unsent = 0` because a send that lands always counts — including one
-// that completes AFTER the row was superseded or timed out (see
-// markSentIfStillPending): the recipient received it either way.
+// that completes AFTER the row was superseded or timed out (see markSentLate):
+// the recipient received it either way.
+//
+// `last_error = NULL`: a delivered message has no error. One left over from an
+// earlier attempt, or from a drop decided while this send was still out
+// (code_no_longer_valid), made /status report a sent message as failing.
 const markSentStmt = db.prepare(
-  `UPDATE messages SET status = 'sent', channel = ?, template_variant = ?, dropped_unsent = 0, updated_at = datetime('now') WHERE id = ?`,
+  `UPDATE messages SET status = 'sent', channel = ?, template_variant = ?, dropped_unsent = 0, last_error = NULL,
+     updated_at = datetime('now') WHERE id = ?`,
 );
-const markSentIfPendingStmt = db.prepare(
-  `UPDATE messages SET status = 'sent', channel = ?, template_variant = ?, dropped_unsent = 0, updated_at = datetime('now')
-   WHERE id = ? AND status = 'pending'`,
+// The drops a send already under way can outrun: supersedePending below, and
+// otp.ts dropping the message of a code that died (a verify, a lock). Neither
+// waits for a send in flight — any other failure is decided by the worker
+// itself, after the send it made has settled.
+const markSentLateStmt = db.prepare(
+  `UPDATE messages SET status = 'sent', channel = ?, template_variant = ?, dropped_unsent = 0, last_error = NULL,
+     updated_at = datetime('now')
+   WHERE id = ? AND (status = 'pending' OR (status = 'failed' AND last_error IN ('superseded', 'code_no_longer_valid')))`,
 );
 // `status = 'pending'`: a send that timed out and landed later may already
 // have marked the row sent — a failure recorded after that must not overwrite
@@ -161,13 +171,18 @@ export function markSent(id: number, channel: Channel, templateVariant: number):
 }
 
 /**
- * For a send that completed after we stopped waiting for it (the 15 s timeout
- * gave up, the call itself did not). Recording it stops the next retry from
- * delivering the same message a second time. A no-op if the row has already
- * moved on — a retry that got there first, or a permanent failure.
+ * For a send known to have gone out but recorded only afterwards: one that
+ * completed after we stopped waiting for it (the 15 s timeout gave up, the
+ * call itself did not), or whose 'sent' the database refused at the time.
+ * Recording it stops the next retry from delivering the same message a second
+ * time. A no-op if the row has already been settled by something that knows
+ * — a retry that got there first, or a real failure. A row dropped meanwhile
+ * as superseded or code_no_longer_valid is not one of those: the drop was
+ * decided while this send was still out, and the message was delivered all
+ * the same — left 'failed', the customer's code counted as never sent.
  */
-export function markSentIfStillPending(id: number, channel: Channel, templateVariant: number): boolean {
-  return Number(markSentIfPendingStmt.run(channel, templateVariant, id).changes) === 1;
+export function markSentLate(id: number, channel: Channel, templateVariant: number): boolean {
+  return Number(markSentLateStmt.run(channel, templateVariant, id).changes) === 1;
 }
 
 export function markFailedPermanently(id: number, error: string): void {

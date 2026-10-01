@@ -28,7 +28,7 @@ const { db, inTransaction } = await import('../db.ts');
 const { generateOtp, verifyOtp } = await import('../otp/otp.ts');
 const { issueAndQueue } = await import('./routes.ts');
 const { getProjectById, config } = await import('../config.ts');
-const { markSent } = await import('../queue/queue.ts');
+const { markSent, getPendingBatch } = await import('../queue/queue.ts');
 
 const store = getProjectById('store')!;
 
@@ -446,4 +446,69 @@ test('a message already on its way when the verify closes its code is not refund
   db.prepare(`UPDATE messages SET attempts = 1, last_error = 'no_server_ack' WHERE id = ?`).run(bId); // one attempt behind it
   assert.deepEqual(verifyOtp(store, phone, codeA, 'login'), { ok: true });
   assert.deepEqual(messageOf(bId), { status: 'failed', attempts: 1, last_error: 'code_no_longer_valid', dropped_unsent: 0 });
+});
+
+// ---- a verify that lands while the waiting code's message is being sent ----
+//
+// The drop above cannot stop a send already under way. Whatever WhatsApp then
+// acknowledges was delivered, and the row has to say so: 'sent', counted, no
+// error left over from the drop.
+
+const { processMessage, defaultGateDeps } = await import('../queue/worker.ts');
+
+function sendingDeps(send: () => Promise<void>, sendTimeoutMs: number) {
+  return {
+    ...defaultGateDeps,
+    isConnected: () => true,
+    activeEnforcement: () => null,
+    checkSendRate: () => ({ allowed: true }),
+    resolveChannel: async () => 'whatsapp' as const,
+    send,
+    sendTimeoutMs,
+  };
+}
+
+function pendingMessage(id: number) {
+  const msg = getPendingBatch(20).find((m) => m.id === id);
+  assert.ok(msg, `message ${id} is pending`);
+  return msg;
+}
+
+test('a verify during a send that is acknowledged in time: the message is recorded sent, with no error left behind', async () => {
+  clear();
+  const phone = '963900001108';
+  const { codeA, bId } = deliveredThenWaiting(phone);
+  const msg = pendingMessage(bId);
+  await processMessage(
+    msg,
+    sendingDeps(async () => {
+      assert.deepEqual(verifyOtp(store, phone, codeA, 'login'), { ok: true }); // the HTTP verify runs during the send
+    }, 1_000),
+  );
+  assert.deepEqual(messageOf(bId), { status: 'sent', attempts: 0, last_error: null, dropped_unsent: 0 });
+});
+
+test('a verify during a send acknowledged only after the timeout: the late ack still records the delivery, and the cooldown holds', async () => {
+  clear();
+  const phone = '963900001109';
+  const { codeA, bId } = deliveredThenWaiting(phone);
+  const msg = pendingMessage(bId);
+  let ack!: () => void;
+  await processMessage(
+    msg,
+    sendingDeps(
+      () =>
+        new Promise<void>((resolve) => {
+          assert.deepEqual(verifyOtp(store, phone, codeA, 'login'), { ok: true });
+          ack = resolve;
+        }),
+      20,
+    ),
+  );
+  ack(); // WhatsApp acknowledged: the message reached the customer
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(messageOf(bId), { status: 'sent', attempts: 0, last_error: null, dropped_unsent: 0 });
+
+  const again = issueAndQueue(store, phone, 'otp', store.otpExpiryMinutes);
+  assert.equal(again.kind === 'rejected' && again.error, 'cooldown', JSON.stringify(again));
 });
