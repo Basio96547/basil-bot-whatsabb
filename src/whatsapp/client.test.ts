@@ -170,3 +170,31 @@ test('no ack at all (a half-open socket swallowed the stanza) is a failure, not 
   const { sock } = fakeSocket(() => undefined);
   await assert.rejects(() => sendTextAwaitingAck(sock, '963900000001@s.whatsapp.net', 'hi'), /no_server_ack/);
 });
+
+// The seam replaces WhatsApp itself. It exists for tests run with node --test;
+// anything else calling it — a script, a stray import in the service — would
+// have the service report messages as delivered that never left the phone.
+test('the socket seam refuses to work outside node --test', async () => {
+  const { execFileSync } = await import('node:child_process');
+  const { repoRoot } = await import('../config.ts');
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    DATA_DIR: mkdtempSync(path.join(tmpdir(), 'sms-api-client-seam-')),
+    DOTENV_CONFIG_PATH: path.join(tmpdir(), 'sms-api-tests-read-no-dotenv'),
+  };
+  delete env.NODE_TEST_CONTEXT; // what node --test sets in each test process
+  const script = `
+    const { setSocketFactoryForTest } = await import('./src/whatsapp/client.ts');
+    try {
+      setSocketFactoryForTest(async () => { throw new Error('unused'); });
+      console.log('accepted');
+    } catch (error) {
+      console.log('refused: ' + error.message);
+    }`;
+  const out = execFileSync(process.execPath, ['--no-warnings', '--import', 'tsx', '--input-type=module', '-e', script], {
+    cwd: repoRoot,
+    env,
+    encoding: 'utf8',
+  });
+  assert.match(out.trim(), /^refused: /, out);
+});

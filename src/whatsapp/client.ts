@@ -204,14 +204,28 @@ async function openWhatsAppSocket(options: SocketOptions): Promise<WASocket> {
   return makeWASocket({ ...options, version: await getProtocolVersion() });
 }
 
-// Replaced only by the end-to-end test, with a stand-in socket that records
-// what would have been sent: everything around the socket (connection
-// handling, the queue worker, the send and its ack) then runs for real, and
-// no test can ever reach WhatsApp's servers. Production never replaces it.
+// Replaced only by tests, with a stand-in socket that records what would have
+// been sent: everything around the socket (connection handling, the queue
+// worker, the send and its ack) then runs for real, and no test can ever reach
+// WhatsApp's servers. Production never replaces it.
 let openSocket: (options: SocketOptions) => Promise<WASocket> = openWhatsAppSocket;
 
-/** Tests only — see `openSocket`. Must be called before startWhatsApp(). */
+/** Whether this process was started by `node --test`: it sets NODE_TEST_CONTEXT in each test process (or keeps --test itself without isolation). */
+function runningUnderNodeTest(): boolean {
+  return process.env.NODE_TEST_CONTEXT !== undefined || process.execArgv.includes('--test');
+}
+
+/**
+ * Tests only — see `openSocket`. Must be called before startWhatsApp().
+ *
+ * Refused outside `node --test`: a stand-in socket acknowledges what it is
+ * given, so the service would report messages as sent that never left the
+ * phone.
+ */
 export function setSocketFactoryForTest(factory: (options: SocketOptions) => Promise<WASocket>): void {
+  if (!runningUnderNodeTest()) {
+    throw new Error('setSocketFactoryForTest works only under node --test — the service always connects through openWhatsAppSocket');
+  }
   openSocket = factory;
 }
 
