@@ -34,8 +34,29 @@ for (const name of ['SMS_PROVIDER', 'SMS_API_URL', 'SMS_API_KEY', 'R2_ACCOUNT_ID
   process.env[name] = '';
 }
 
-const { prepareSession, connectWhatsApp, getConnectionState, isLinkedIdentity, getSocket, sendTextAwaitingAck, WhatsAppRejectedError } =
-  await import('./client.ts');
+const {
+  prepareSession,
+  connectWhatsApp,
+  getConnectionState,
+  isLinkedIdentity,
+  getSocket,
+  sendTextAwaitingAck,
+  WhatsAppRejectedError,
+  setSocketFactoryForTest,
+} = await import('./client.ts');
+
+// Every connectWhatsApp() in this file must stop before it opens a socket. One
+// that got that far — a regression in any of the guards below — used to reach
+// Baileys' real makeWASocket, which dials WhatsApp's servers (and GitHub, for
+// the protocol version) from a plain test run. It meets this instead.
+const socketsOpened: unknown[] = [];
+setSocketFactoryForTest(async (options) => {
+  socketsOpened.push(options);
+  throw new Error('client.test.ts: a test tried to open a WhatsApp socket');
+});
+test.after(() => {
+  assert.equal(socketsOpened.length, 0, 'no test here may open a WhatsApp socket');
+});
 
 const AUTH_DIR = path.join(process.env.DATA_DIR, 'auth-session');
 
@@ -86,6 +107,7 @@ test('during an active WhatsApp restriction, an unpaired identity is not even of
   recordEnforcement({ type: 'RESTRICT_ALL_COMPANIONS', endsAtMs: Date.now() + 60 * 60_000 });
   try {
     await connectWhatsApp(); // must return without opening a socket
+    assert.equal(socketsOpened.length, 0);
     assert.throws(() => getSocket(), /not initialized/);
     const state = getConnectionState();
     assert.equal(state.needsReauth, true);
