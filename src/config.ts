@@ -98,6 +98,33 @@ export function numberEnv(name: string, fallback: number, bounds: { min?: number
   return value;
 }
 
+// WhatsApp's server closes a socket the client has been silent on for 45 s —
+// measured 2026-10-12: with no keep-alive the close (428 "Connection
+// Terminated") lands at 45.0 s every time, while 35 s and 40 s intervals held
+// for minutes. The 60 s interval shipped since 2026-09-03 therefore lost the
+// connection ~45 s after EVERY connect, before its first ping was even sent:
+// the "code_428 reconnect cycles" this phone's logs showed were this, not the
+// network. And because a connection has to last two minutes before the
+// reconnect backoff resets (STABLE_CONNECTION_MS in whatsapp/client.ts), the
+// wait between them climbed to five minutes — the service was offline most of
+// the time, and reconnecting every few minutes is itself a ban signal.
+export const KEEP_ALIVE_DEFAULT_MS = 30_000; // Baileys' own default
+// 10 s under the server's limit, for timer drift and a radio waking from idle.
+export const KEEP_ALIVE_MAX_MS = 35_000;
+
+// Above the ceiling the default is used with a warning, NOT refused like the
+// other limits here: the phone's .env carries the 60000 that .env.example
+// shipped, and refusing it would make scripts/preflight.sh block the very
+// deploy that carries this fix — leaving the broken service running.
+export function keepAliveEnv(name: string, warn: (message: string) => void = console.warn): number {
+  const value = numberEnv(name, KEEP_ALIVE_DEFAULT_MS, { min: 1_000, integer: true });
+  if (value <= KEEP_ALIVE_MAX_MS) return value;
+  warn(
+    `[config] ${name}=${value} يتجاوز حد الخمول عند خادم واتساب (٤٥ ثانية) فيُقطع الاتصال قبل أول نبضة — استُعملت ${KEEP_ALIVE_DEFAULT_MS} بدلاً منها. عدّل السطر في .env إلى ${KEEP_ALIVE_DEFAULT_MS}`,
+  );
+  return KEEP_ALIVE_DEFAULT_MS;
+}
+
 // Same fail-fast contract as requireEnv: a malformed template block stops the
 // service at boot instead of surfacing as a broken message weeks later.
 function requireValidTemplates(projectId: string, templates: TemplateOverrides | undefined): void {
@@ -196,11 +223,10 @@ export const config = {
   whatsappNumber: process.env.WHATSAPP_NUMBER ?? '',
 
   whatsapp: {
-    // Doubled from Baileys' 30s default: each keep-alive wakes the phone's
-    // radio. Configurable because raising it too far lets the server drop the
-    // socket as idle, which costs a reconnect — and reconnect churn on an
-    // unofficial client is itself a ban signal.
-    keepAliveIntervalMs: numberEnv('KEEP_ALIVE_INTERVAL_MS', 60_000, { min: 1_000, integer: true }),
+    // Each keep-alive wakes the phone's radio, but a longer interval cannot
+    // save anything: past the server's idle limit the socket is dropped and
+    // the reconnect costs far more than the pings — see keepAliveEnv.
+    keepAliveIntervalMs: keepAliveEnv('KEEP_ALIVE_INTERVAL_MS'),
   },
 
   // Ceiling on TOTAL messages leaving this service, independent of the
