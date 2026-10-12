@@ -70,6 +70,33 @@ test('a numeric env var that parses but makes no sense is refused, not silently 
   }
 });
 
+test('a keep-alive past WhatsApp\'s 45 s idle limit falls back to the default with a warning, instead of dropping every connection', async () => {
+  const { keepAliveEnv, KEEP_ALIVE_DEFAULT_MS, KEEP_ALIVE_MAX_MS } = await import('./config.ts');
+  const warnings: string[] = [];
+  const warn = (message: string) => warnings.push(message);
+  try {
+    // The value .env.example shipped, and so the one on the phone.
+    process.env.TEST_KEEP_ALIVE = '60000';
+    assert.equal(keepAliveEnv('TEST_KEEP_ALIVE', warn), KEEP_ALIVE_DEFAULT_MS);
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /TEST_KEEP_ALIVE=60000/);
+
+    warnings.length = 0;
+    process.env.TEST_KEEP_ALIVE = String(KEEP_ALIVE_MAX_MS);
+    assert.equal(keepAliveEnv('TEST_KEEP_ALIVE', warn), KEEP_ALIVE_MAX_MS);
+    process.env.TEST_KEEP_ALIVE = '';
+    assert.equal(keepAliveEnv('TEST_KEEP_ALIVE', warn), KEEP_ALIVE_DEFAULT_MS);
+    assert.deepEqual(warnings, []);
+
+    // Still a broken value, not a tuning choice — refused like the rest.
+    process.env.TEST_KEEP_ALIVE = '500';
+    assert.throws(() => keepAliveEnv('TEST_KEEP_ALIVE', warn), />= 1000/);
+  } finally {
+    delete process.env.TEST_KEEP_ALIVE;
+  }
+  assert.ok(KEEP_ALIVE_DEFAULT_MS <= KEEP_ALIVE_MAX_MS && KEEP_ALIVE_MAX_MS < 45_000);
+});
+
 test('the service listens on loopback unless HOST says otherwise', () => {
   assert.equal(config.host, process.env.HOST || '127.0.0.1');
 });
@@ -104,6 +131,12 @@ test('a send delay range that is upside down stops the boot', () => {
   const boot = bootConfig({ SEND_MIN_DELAY_MS: '9000', SEND_MAX_DELAY_MS: '3000' });
   assert.equal(boot.ok, false);
   assert.match(boot.stderr, /SEND_MAX_DELAY_MS/);
+});
+
+test('the phone\'s old KEEP_ALIVE_INTERVAL_MS=60000 still boots — preflight must not block the deploy that fixes it', () => {
+  const boot = bootConfig({ KEEP_ALIVE_INTERVAL_MS: '60000' });
+  assert.equal(boot.ok, true, boot.stderr);
+  assert.match(boot.stderr, /KEEP_ALIVE_INTERVAL_MS=60000/);
 });
 
 test('the same environment with real values boots', () => {
